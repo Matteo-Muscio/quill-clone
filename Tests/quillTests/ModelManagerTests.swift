@@ -16,6 +16,7 @@ final class ModelManagerTests: XCTestCase {
         let outcome: Outcome
         private var continuation: CheckedContinuation<Void, Error>?
         private var cancellationRequested = false
+        private(set) var callCount = 0
 
         init(outcome: Outcome) {
             self.outcome = outcome
@@ -25,6 +26,7 @@ final class ModelManagerTests: XCTestCase {
             progress: @escaping @Sendable (Double) -> Void,
             verifying: @escaping @Sendable () -> Void
         ) async throws {
+            callCount += 1
             progress(0.7)
             progress(0.4)
             verifying()
@@ -66,13 +68,18 @@ final class ModelManagerTests: XCTestCase {
     }
 
     @MainActor
-    final class FailingPersistence {
+    final class ActivationPersistence {
         struct TestError: LocalizedError {
             var errorDescription: String? { "config write failed" }
         }
 
+        private var shouldFail = true
+
         func persist(_ model: TranscriptionModel) throws {
-            throw TestError()
+            if shouldFail {
+                shouldFail = false
+                throw TestError()
+            }
         }
     }
 
@@ -250,9 +257,9 @@ final class ModelManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testCancellingRetryAfterActivationFailureRestoresInstalledState() async {
-        let download = DownloadHarness(outcome: .suspended)
-        let persistence = FailingPersistence()
+    func testActivationFailureRetriesPersistenceWithoutDownloading() async {
+        let download = DownloadHarness(outcome: .success)
+        let persistence = ActivationPersistence()
         let manager = makeManager(
             installed: [.parakeetV2, .parakeetV3],
             harness: download,
@@ -262,16 +269,15 @@ final class ModelManagerTests: XCTestCase {
         manager.activate(.parakeetV3)
         XCTAssertEqual(
             manager.state(for: .parakeetV3),
-            .failed("config write failed")
+            .activationFailed("config write failed")
         )
-        let retry = Task { await manager.downloadAndUse(.parakeetV3) }
-        await waitUntil { manager.state(for: .parakeetV3) == .verifying }
 
-        manager.cancel()
-        await retry.value
+        manager.activate(.parakeetV3)
 
-        XCTAssertEqual(manager.state(for: .parakeetV3), .installed)
-        XCTAssertEqual(manager.activeModel, .parakeetV2)
+        let downloadCalls = await download.callCount
+        XCTAssertEqual(manager.state(for: .parakeetV3), .active)
+        XCTAssertEqual(manager.activeModel, .parakeetV3)
+        XCTAssertEqual(downloadCalls, 0)
     }
 
     @MainActor

@@ -8,6 +8,7 @@ enum ModelState: Equatable, Sendable {
     case installed
     case active
     case failed(String)
+    case activationFailed(String)
 }
 
 @MainActor
@@ -119,7 +120,13 @@ final class ModelManager: ObservableObject {
     }
 
     func activate(_ model: TranscriptionModel) {
-        guard !actionsLocked, !isPreparingModel, state(for: model) == .installed else {
+        guard !actionsLocked, !isPreparingModel else {
+            return
+        }
+        switch state(for: model) {
+        case .installed, .activationFailed:
+            break
+        default:
             return
         }
 
@@ -127,7 +134,7 @@ final class ModelManager: ObservableObject {
             try operations.persist(model)
             finishActivation(model)
         } catch {
-            setState(.failed(error.localizedDescription), for: model)
+            setState(.activationFailed(error.localizedDescription), for: model)
         }
     }
 
@@ -215,6 +222,8 @@ final class ModelManager: ObservableObject {
         switch previousState {
         case .installed, .active:
             return previousState
+        case .activationFailed:
+            return .installed
         default:
             return .notInstalled
         }
@@ -243,7 +252,7 @@ final class ModelManager: ObservableObject {
         switch state {
         case .notInstalled, .installed, .active:
             true
-        case .downloading, .verifying, .failed:
+        case .downloading, .verifying, .failed, .activationFailed:
             false
         }
     }

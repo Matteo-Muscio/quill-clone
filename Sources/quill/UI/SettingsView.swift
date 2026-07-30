@@ -119,6 +119,11 @@ private struct ModelRow: View {
                 .foregroundStyle(.orange)
                 .accessibilityLabel("Model preparation failed")
                 .help("Model preparation failed")
+        case .activationFailed:
+            Image(systemName: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Model activation failed")
+                .help("Model activation failed")
         }
     }
 
@@ -135,7 +140,7 @@ private struct ModelRow: View {
         case .verifying:
             ProgressView("Verifying…")
                 .accessibilityLabel("Verifying \(model.displayName)")
-        case .failed(let message):
+        case .failed(let message), .activationFailed(let message):
             Text(message)
                 .font(.caption)
                 .foregroundStyle(.red)
@@ -179,6 +184,12 @@ private struct ModelRow: View {
             }
             .disabled(actionsDisabled)
             .help(actionUnavailableHelp ?? "Retry downloading and verifying this model")
+        case .activationFailed:
+            Button("Retry Activation") {
+                manager.activate(model)
+            }
+            .disabled(actionsDisabled)
+            .help(actionUnavailableHelp ?? "Retry activating this installed model")
         }
     }
 
