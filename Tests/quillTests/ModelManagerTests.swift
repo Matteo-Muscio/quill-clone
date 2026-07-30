@@ -15,6 +15,7 @@ final class ModelManagerTests: XCTestCase {
 
         let outcome: Outcome
         private var continuation: CheckedContinuation<Void, Error>?
+        private var cancellationRequested = false
 
         init(outcome: Outcome) {
             self.outcome = outcome
@@ -35,8 +36,12 @@ final class ModelManagerTests: XCTestCase {
                 throw TestError()
             case .suspended:
                 try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation {
-                        continuation = $0
+                    try await withCheckedThrowingContinuation { continuation in
+                        if cancellationRequested {
+                            continuation.resume(throwing: CancellationError())
+                        } else {
+                            self.continuation = continuation
+                        }
                     }
                 } onCancel: {
                     Task { await self.cancelDownload() }
@@ -45,8 +50,12 @@ final class ModelManagerTests: XCTestCase {
         }
 
         private func cancelDownload() {
-            continuation?.resume(throwing: CancellationError())
-            continuation = nil
+            if let continuation {
+                continuation.resume(throwing: CancellationError())
+                self.continuation = nil
+            } else {
+                cancellationRequested = true
+            }
         }
     }
 
@@ -55,12 +64,41 @@ final class ModelManagerTests: XCTestCase {
         var models: [TranscriptionModel] = []
     }
 
+    actor ProbeHarness {
+        private var resultContinuation: CheckedContinuation<Bool, Never>?
+        private var startContinuation: CheckedContinuation<Void, Never>?
+        private var started = false
+
+        func isInstalled(_ model: TranscriptionModel) async -> Bool {
+            guard model == .parakeetV3 else { return true }
+            started = true
+            startContinuation?.resume()
+            startContinuation = nil
+            return await withCheckedContinuation {
+                resultContinuation = $0
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation {
+                startContinuation = $0
+            }
+        }
+
+        func resolve(_ installed: Bool) {
+            resultContinuation?.resume(returning: installed)
+            resultContinuation = nil
+        }
+    }
+
     @MainActor
-    func testInitialStateReflectsInstalledModels() {
+    func testInitialStateReflectsInstalledModels() async {
         let manager = makeManager(
             active: .parakeetV2,
             installed: [.parakeetV2, .parakeetV3]
         )
+        await waitUntil { manager.state(for: .parakeetV2) == .active }
 
         XCTAssertEqual(manager.state(for: .parakeetV2), .active)
         XCTAssertEqual(manager.state(for: .parakeetV3), .installed)
@@ -141,6 +179,20 @@ final class ModelManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testCancellingCallerCancelsDownloadAndRestoresState() async {
+        let harness = DownloadHarness(outcome: .suspended)
+        let manager = makeManager(harness: harness)
+        let task = Task { await manager.downloadAndUse(.parakeetV3) }
+        await waitUntil { manager.state(for: .parakeetV3) == .verifying }
+
+        task.cancel()
+        await task.value
+
+        XCTAssertEqual(manager.state(for: .parakeetV3), .notInstalled)
+        XCTAssertFalse(manager.isPreparingModel)
+    }
+
+    @MainActor
     func testFailureLeavesSelectionUnchangedAndOffersRetry() async {
         let harness = DownloadHarness(outcome: .failure)
         let manager = makeManager(harness: harness)
@@ -192,6 +244,27 @@ final class ModelManagerTests: XCTestCase {
 
         manager.cancel()
         await task.value
+    }
+
+    @MainActor
+    func testLateInstallationProbeCannotOverwriteActivation() async {
+        let probe = ProbeHarness()
+        let manager = ModelManager(
+            activeModel: .parakeetV2,
+            operations: .init(
+                isInstalled: { await probe.isInstalled($0) },
+                downloadAndVerify: { _, _, verifying in verifying() },
+                persist: { _ in }
+            )
+        )
+        await probe.waitUntilStarted()
+
+        await manager.downloadAndUse(.parakeetV3)
+        await probe.resolve(false)
+        await Task.yield()
+
+        XCTAssertEqual(manager.state(for: .parakeetV3), .active)
+        XCTAssertEqual(manager.activeModel, .parakeetV3)
     }
 
     @MainActor

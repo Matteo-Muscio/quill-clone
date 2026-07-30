@@ -13,7 +13,7 @@ enum ModelState: Equatable, Sendable {
 @MainActor
 final class ModelManager: ObservableObject {
     struct Operations: Sendable {
-        var isInstalled: @Sendable (TranscriptionModel) -> Bool
+        var isInstalled: @Sendable (TranscriptionModel) async -> Bool
         var downloadAndVerify:
             @Sendable (
                 TranscriptionModel,
@@ -23,7 +23,7 @@ final class ModelManager: ObservableObject {
         var persist: @MainActor @Sendable (TranscriptionModel) throws -> Void
 
         static let live = Operations(
-            isInstalled: { ModelStore.shared.isInstalled($0) },
+            isInstalled: { await ModelStore.shared.isInstalled($0) },
             downloadAndVerify: { model, progress, verifying in
                 try await ModelStore.shared.downloadAndVerify(
                     model,
@@ -49,6 +49,7 @@ final class ModelManager: ObservableObject {
     private let onActivation: @MainActor @Sendable () -> Void
     private var downloadTask: Task<Void, Never>?
     private var operationID: UUID?
+    private var stateVersions: [TranscriptionModel: Int]
 
     init(
         activeModel: TranscriptionModel = Config.transcriptionModel(),
@@ -63,18 +64,35 @@ final class ModelManager: ObservableObject {
         self.operations = operations
         self.onActivation = onActivation
 
-        var states: [TranscriptionModel: ModelState] = [:]
-        for model in TranscriptionModel.allCases {
-            states[model] = operations.isInstalled(model) ? .installed : .notInstalled
+        self.states = Dictionary(
+            uniqueKeysWithValues: TranscriptionModel.allCases.map { ($0, .notInstalled) }
+        )
+        self.stateVersions = Dictionary(
+            uniqueKeysWithValues: TranscriptionModel.allCases.map { ($0, 0) }
+        )
+
+        Task { [weak self] in
+            await self?.refreshInstallationStates()
         }
-        if states[activeModel] == .installed {
-            states[activeModel] = .active
-        }
-        self.states = states
     }
 
     func state(for model: TranscriptionModel) -> ModelState {
         states[model] ?? .notInstalled
+    }
+
+    func refreshInstallationStates() async {
+        for model in TranscriptionModel.allCases {
+            guard isPassive(state(for: model)) else { continue }
+            let version = stateVersions[model, default: 0]
+            let installed = await operations.isInstalled(model)
+            guard stateVersions[model, default: 0] == version,
+                  isPassive(state(for: model))
+            else { continue }
+            setState(
+                installed ? (model == activeModel ? .active : .installed) : .notInstalled,
+                for: model
+            )
+        }
     }
 
     func downloadAndUse(_ model: TranscriptionModel) async {
@@ -84,14 +102,18 @@ final class ModelManager: ObservableObject {
         let id = UUID()
         operationID = id
         isPreparingModel = true
-        states[model] = .downloading(0)
+        setState(.downloading(0), for: model)
 
         let task = Task { [weak self] in
             guard let self else { return }
             await self.performDownload(model, previousState: previousState, id: id)
         }
         downloadTask = task
-        await task.value
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     func cancel() {
@@ -107,7 +129,7 @@ final class ModelManager: ObservableObject {
             try operations.persist(model)
             finishActivation(model)
         } catch {
-            states[model] = .failed(error.localizedDescription)
+            setState(.failed(error.localizedDescription), for: model)
         }
     }
 
@@ -136,11 +158,11 @@ final class ModelManager: ObservableObject {
             finishActivation(model)
         } catch is CancellationError {
             if operationID == id {
-                states[model] = restoredState(previousState, for: model)
+                setState(restoredState(previousState), for: model)
             }
         } catch {
             if operationID == id {
-                states[model] = .failed(error.localizedDescription)
+                setState(.failed(error.localizedDescription), for: model)
             }
         }
 
@@ -159,34 +181,45 @@ final class ModelManager: ObservableObject {
         guard operationID == id, case .downloading(let current) = state(for: model) else {
             return
         }
-        states[model] = .downloading(max(current, min(max(incoming, 0), 1)))
+        setState(.downloading(max(current, min(max(incoming, 0), 1))), for: model)
     }
 
     private func beginVerification(for model: TranscriptionModel, id: UUID) {
         guard operationID == id, case .downloading = state(for: model) else { return }
-        states[model] = .verifying
+        setState(.verifying, for: model)
     }
 
     private func finishActivation(_ model: TranscriptionModel) {
         if model != activeModel {
-            states[activeModel] = operations.isInstalled(activeModel)
-                ? .installed
-                : .notInstalled
+            if state(for: activeModel) == .active {
+                setState(.installed, for: activeModel)
+            }
         }
         activeModel = model
-        states[model] = .active
+        setState(.active, for: model)
         onActivation()
     }
 
-    private func restoredState(
-        _ previousState: ModelState,
-        for model: TranscriptionModel
-    ) -> ModelState {
+    private func restoredState(_ previousState: ModelState) -> ModelState {
         switch previousState {
         case .installed, .active:
             return previousState
         default:
-            return operations.isInstalled(model) ? .installed : .notInstalled
+            return .notInstalled
         }
+    }
+
+    private func isPassive(_ state: ModelState) -> Bool {
+        switch state {
+        case .notInstalled, .installed, .active:
+            true
+        case .downloading, .verifying, .failed:
+            false
+        }
+    }
+
+    private func setState(_ state: ModelState, for model: TranscriptionModel) {
+        stateVersions[model, default: 0] += 1
+        states[model] = state
     }
 }
