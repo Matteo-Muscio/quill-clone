@@ -13,7 +13,7 @@ enum ModelState: Equatable, Sendable {
 @MainActor
 final class ModelManager: ObservableObject {
     struct Operations: Sendable {
-        var isInstalled: @Sendable (TranscriptionModel) async -> Bool
+        var isInstalled: @Sendable (TranscriptionModel) async throws -> Bool
         var downloadAndVerify:
             @Sendable (
                 TranscriptionModel,
@@ -23,7 +23,7 @@ final class ModelManager: ObservableObject {
         var persist: @MainActor @Sendable (TranscriptionModel) throws -> Void
 
         static let live = Operations(
-            isInstalled: { await ModelStore.shared.isInstalled($0) },
+            isInstalled: { try await ModelStore.shared.isInstalled($0) },
             downloadAndVerify: { model, progress, verifying in
                 try await ModelStore.shared.downloadAndVerify(
                     model,
@@ -50,6 +50,7 @@ final class ModelManager: ObservableObject {
     private var downloadTask: Task<Void, Never>?
     private var operationID: UUID?
     private var stateVersions: [TranscriptionModel: Int]
+    private var resolvedModels: Set<TranscriptionModel> = []
 
     init(
         activeModel: TranscriptionModel = Config.transcriptionModel(),
@@ -82,16 +83,7 @@ final class ModelManager: ObservableObject {
 
     func refreshInstallationStates() async {
         for model in TranscriptionModel.allCases {
-            guard isPassive(state(for: model)) else { continue }
-            let version = stateVersions[model, default: 0]
-            let installed = await operations.isInstalled(model)
-            guard stateVersions[model, default: 0] == version,
-                  isPassive(state(for: model))
-            else { continue }
-            setState(
-                installed ? (model == activeModel ? .active : .installed) : .notInstalled,
-                for: model
-            )
+            await refreshInstallationState(for: model)
         }
     }
 
@@ -99,6 +91,7 @@ final class ModelManager: ObservableObject {
         guard !actionsLocked, downloadTask == nil else { return }
 
         let previousState = state(for: model)
+        let wasResolved = resolvedModels.contains(model)
         let id = UUID()
         operationID = id
         isPreparingModel = true
@@ -106,7 +99,12 @@ final class ModelManager: ObservableObject {
 
         let task = Task { [weak self] in
             guard let self else { return }
-            await self.performDownload(model, previousState: previousState, id: id)
+            await self.performDownload(
+                model,
+                previousState: previousState,
+                wasResolved: wasResolved,
+                id: id
+            )
         }
         downloadTask = task
         await withTaskCancellationHandler {
@@ -136,8 +134,10 @@ final class ModelManager: ObservableObject {
     private func performDownload(
         _ model: TranscriptionModel,
         previousState: ModelState,
+        wasResolved: Bool,
         id: UUID
     ) async {
+        var shouldRefresh = false
         do {
             try await operations.downloadAndVerify(
                 model,
@@ -159,6 +159,7 @@ final class ModelManager: ObservableObject {
         } catch is CancellationError {
             if operationID == id {
                 setState(restoredState(previousState), for: model)
+                shouldRefresh = !wasResolved
             }
         } catch {
             if operationID == id {
@@ -170,6 +171,12 @@ final class ModelManager: ObservableObject {
             operationID = nil
             downloadTask = nil
             isPreparingModel = false
+        }
+        if shouldRefresh {
+            let refreshTask = Task {
+                await refreshInstallationState(for: model)
+            }
+            await refreshTask.value
         }
     }
 
@@ -207,6 +214,25 @@ final class ModelManager: ObservableObject {
         default:
             return .notInstalled
         }
+    }
+
+    private func refreshInstallationState(for model: TranscriptionModel) async {
+        guard isPassive(state(for: model)) else { return }
+        let version = stateVersions[model, default: 0]
+        let installed: Bool
+        do {
+            installed = try await operations.isInstalled(model)
+        } catch {
+            return
+        }
+        guard stateVersions[model, default: 0] == version,
+              isPassive(state(for: model))
+        else { return }
+        setState(
+            installed ? (model == activeModel ? .active : .installed) : .notInstalled,
+            for: model
+        )
+        resolvedModels.insert(model)
     }
 
     private func isPassive(_ state: ModelState) -> Bool {

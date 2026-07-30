@@ -68,9 +68,11 @@ final class ModelManagerTests: XCTestCase {
         private var resultContinuation: CheckedContinuation<Bool, Never>?
         private var startContinuation: CheckedContinuation<Void, Never>?
         private var started = false
+        private var resolved: Bool?
 
         func isInstalled(_ model: TranscriptionModel) async -> Bool {
             guard model == .parakeetV3 else { return true }
+            if let resolved { return resolved }
             started = true
             startContinuation?.resume()
             startContinuation = nil
@@ -87,6 +89,7 @@ final class ModelManagerTests: XCTestCase {
         }
 
         func resolve(_ installed: Bool) {
+            resolved = installed
             resultContinuation?.resume(returning: installed)
             resultContinuation = nil
         }
@@ -98,7 +101,10 @@ final class ModelManagerTests: XCTestCase {
             active: .parakeetV2,
             installed: [.parakeetV2, .parakeetV3]
         )
-        await waitUntil { manager.state(for: .parakeetV2) == .active }
+        await waitUntil {
+            manager.state(for: .parakeetV2) == .active
+                && manager.state(for: .parakeetV3) == .installed
+        }
 
         XCTAssertEqual(manager.state(for: .parakeetV2), .active)
         XCTAssertEqual(manager.state(for: .parakeetV3), .installed)
@@ -190,6 +196,34 @@ final class ModelManagerTests: XCTestCase {
 
         XCTAssertEqual(manager.state(for: .parakeetV3), .notInstalled)
         XCTAssertFalse(manager.isPreparingModel)
+    }
+
+    @MainActor
+    func testCancellationReprobesAnUnresolvedInstalledModel() async {
+        let probe = ProbeHarness()
+        let download = DownloadHarness(outcome: .suspended)
+        let manager = ModelManager(
+            activeModel: .parakeetV2,
+            operations: .init(
+                isInstalled: {
+                    try Task.checkCancellation()
+                    return await probe.isInstalled($0)
+                },
+                downloadAndVerify: { _, progress, verifying in
+                    try await download.download(progress: progress, verifying: verifying)
+                },
+                persist: { _ in }
+            )
+        )
+        await probe.waitUntilStarted()
+        let task = Task { await manager.downloadAndUse(.parakeetV3) }
+        await waitUntil { manager.state(for: .parakeetV3) == .verifying }
+
+        manager.cancel()
+        await probe.resolve(true)
+        await task.value
+
+        XCTAssertEqual(manager.state(for: .parakeetV3), .installed)
     }
 
     @MainActor
