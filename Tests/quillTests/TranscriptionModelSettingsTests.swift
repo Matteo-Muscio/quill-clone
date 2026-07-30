@@ -96,13 +96,15 @@ final class TranscriptionModelSettingsTests: XCTestCase {
 
     func testCachedLoadsRequestOfflineAccess() async {
         let recorder = EventRecorder()
+        let mode = LockedValue(false)
         let store = ModelStore(operations: .init(
+            offlineMode: mode.access,
             isInstalled: { _ in false },
-            loadCached: { _, offline in
-                await recorder.append(offline ? "offline" : "online")
+            loadCached: { _ in
+                await recorder.append(mode.value ? "offline" : "online")
                 throw TestError.expected
             },
-            downloadAndVerify: { _, _, _, _ in }
+            downloadAndVerify: { _, _, _ in }
         ))
 
         do {
@@ -116,11 +118,13 @@ final class TranscriptionModelSettingsTests: XCTestCase {
 
     func testExplicitDownloadsRequestOnlineAccess() async throws {
         let recorder = EventRecorder()
+        let mode = LockedValue(true)
         let store = ModelStore(operations: .init(
+            offlineMode: mode.access,
             isInstalled: { _ in false },
-            loadCached: { _, _ in throw TestError.expected },
-            downloadAndVerify: { _, online, _, verifying in
-                await recorder.append(online ? "online" : "offline")
+            loadCached: { _ in throw TestError.expected },
+            downloadAndVerify: { _, _, verifying in
+                await recorder.append(mode.value ? "offline" : "online")
                 verifying()
             }
         ))
@@ -129,20 +133,22 @@ final class TranscriptionModelSettingsTests: XCTestCase {
 
         let events = await recorder.values
         XCTAssertEqual(events, ["online"])
+        XCTAssertTrue(mode.value)
     }
 
     func testCacheLoadAndDownloadCannotOverlap() async {
         let recorder = EventRecorder()
         let gate = TestGate()
         let store = ModelStore(operations: .init(
+            offlineMode: LockedValue(false).access,
             isInstalled: { _ in false },
-            loadCached: { _, _ in
+            loadCached: { _ in
                 await recorder.append("load-start")
                 await gate.wait()
                 await recorder.append("load-end")
                 throw TestError.expected
             },
-            downloadAndVerify: { _, _, _, _ in
+            downloadAndVerify: { _, _, _ in
                 await recorder.append("download")
             }
         ))
@@ -169,12 +175,13 @@ final class TranscriptionModelSettingsTests: XCTestCase {
     func testCacheLoadFailureDoesNotInvokeDownload() async {
         let recorder = EventRecorder()
         let store = ModelStore(operations: .init(
+            offlineMode: LockedValue(false).access,
             isInstalled: { _ in false },
-            loadCached: { _, _ in
+            loadCached: { _ in
                 await recorder.append("load")
                 throw TestError.expected
             },
-            downloadAndVerify: { _, _, _, _ in
+            downloadAndVerify: { _, _, _ in
                 await recorder.append("download")
             }
         ))
@@ -185,30 +192,32 @@ final class TranscriptionModelSettingsTests: XCTestCase {
         XCTAssertEqual(events, ["load"])
     }
 
-    func testInstalledProbeUsesModelStoreBoundary() async {
+    func testInstalledProbeUsesModelStoreBoundary() async throws {
         let store = ModelStore(operations: .init(
+            offlineMode: LockedValue(false).access,
             isInstalled: { $0 == .parakeetV2 },
-            loadCached: { _, _ in throw TestError.expected },
-            downloadAndVerify: { _, _, _, _ in }
+            loadCached: { _ in throw TestError.expected },
+            downloadAndVerify: { _, _, _ in }
         ))
 
-        let v2Installed = await store.isInstalled(.parakeetV2)
-        let v3Installed = await store.isInstalled(.parakeetV3)
+        let v2Installed = try await store.isInstalled(.parakeetV2)
+        let v3Installed = try await store.isInstalled(.parakeetV3)
         XCTAssertTrue(v2Installed)
         XCTAssertFalse(v3Installed)
     }
 
-    func testInstalledProbeWaitsBehindActiveStoreOperation() async {
+    func testInstalledProbeWaitsBehindActiveStoreOperation() async throws {
         let operationGate = TestGate()
         let probeStarted = LockedFlag()
         let probeRan = LockedFlag()
         let store = ModelStore(operations: .init(
+            offlineMode: LockedValue(false).access,
             isInstalled: { _ in
                 probeRan.set()
                 return true
             },
-            loadCached: { _, _ in throw TestError.expected },
-            downloadAndVerify: { _, _, _, _ in
+            loadCached: { _ in throw TestError.expected },
+            downloadAndVerify: { _, _, _ in
                 await operationGate.wait()
             }
         ))
@@ -223,7 +232,7 @@ final class TranscriptionModelSettingsTests: XCTestCase {
         await operationGate.waitUntilEntered()
         let probe = Task {
             probeStarted.set()
-            return await store.isInstalled(.parakeetV3)
+            return try await store.isInstalled(.parakeetV3)
         }
         while !probeStarted.value {
             await Task.yield()
@@ -235,7 +244,107 @@ final class TranscriptionModelSettingsTests: XCTestCase {
 
         await operationGate.open()
         _ = await download.value
-        let installed = await probe.value
+        let installed = try await probe.value
+        XCTAssertTrue(installed)
+        XCTAssertTrue(probeRan.value)
+    }
+
+    func testOfflineModeRestoresAfterThrownError() async {
+        let mode = LockedValue(false)
+        let store = ModelStore(operations: .init(
+            offlineMode: mode.access,
+            isInstalled: { _ in false },
+            loadCached: { _ in throw TestError.expected },
+            downloadAndVerify: { _, _, _ in }
+        ))
+
+        _ = try? await store.loadCached(.parakeetV3)
+
+        XCTAssertFalse(mode.value)
+    }
+
+    func testOfflineModeRestoresAfterCancellation() async {
+        let mode = LockedValue(true)
+        let entered = LockedFlag()
+        let store = ModelStore(operations: .init(
+            offlineMode: mode.access,
+            isInstalled: { _ in false },
+            loadCached: { _ in throw TestError.expected },
+            downloadAndVerify: { _, _, _ in
+                entered.set()
+                while !Task.isCancelled {
+                    await Task.yield()
+                }
+                try Task.checkCancellation()
+            }
+        ))
+        let task = Task {
+            try await store.downloadAndVerify(
+                .parakeetV3,
+                progress: { _ in },
+                verifying: {}
+            )
+        }
+        while !entered.value {
+            await Task.yield()
+        }
+
+        task.cancel()
+        _ = try? await task.value
+
+        XCTAssertTrue(mode.value)
+    }
+
+    func testCancelledQueuedOperationDoesNotRunAndNextWaiterProgresses() async throws {
+        let activeGate = TestGate()
+        let queuedStarted = LockedFlag()
+        let downloadRan = LockedFlag()
+        let probeRan = LockedFlag()
+        let store = ModelStore(operations: .init(
+            offlineMode: LockedValue(false).access,
+            isInstalled: { _ in
+                probeRan.set()
+                return true
+            },
+            loadCached: { _ in
+                await activeGate.wait()
+                throw TestError.expected
+            },
+            downloadAndVerify: { _, _, _ in
+                downloadRan.set()
+            }
+        ))
+        let active = Task { try? await store.loadCached(.parakeetV3) }
+        await activeGate.waitUntilEntered()
+        let cancelled = Task {
+            queuedStarted.set()
+            try await store.downloadAndVerify(
+                .parakeetV2,
+                progress: { _ in },
+                verifying: {}
+            )
+        }
+        while !queuedStarted.value {
+            await Task.yield()
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        cancelled.cancel()
+        let probe = Task { try await store.isInstalled(.parakeetV3) }
+
+        await activeGate.open()
+        _ = await active.value
+        do {
+            try await cancelled.value
+            XCTFail("cancelled queued operation unexpectedly completed")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected cancellation error: \(error)")
+        }
+        let installed = try await probe.value
+
+        XCTAssertFalse(downloadRan.value)
         XCTAssertTrue(installed)
         XCTAssertTrue(probeRan.value)
     }
@@ -310,5 +419,27 @@ private final class LockedFlag: @unchecked Sendable {
 
     func set() {
         lock.withLock { flag = true }
+    }
+}
+
+private final class LockedValue<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) {
+        stored = value
+    }
+
+    var value: Value {
+        lock.withLock { stored }
+    }
+}
+
+private extension LockedValue where Value == Bool {
+    var access: ModelStore.OfflineMode {
+        .init(
+            get: { [self] in value },
+            set: { [self] newValue in lock.withLock { stored = newValue } }
+        )
     }
 }
