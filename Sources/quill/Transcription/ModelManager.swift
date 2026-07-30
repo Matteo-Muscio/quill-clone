@@ -159,7 +159,11 @@ final class ModelManager: ObservableObject {
         } catch is CancellationError {
             if operationID == id {
                 setState(restoredState(previousState), for: model)
-                shouldRefresh = !wasResolved
+                if case .failed = previousState {
+                    shouldRefresh = true
+                } else {
+                    shouldRefresh = !wasResolved
+                }
             }
         } catch {
             if operationID == id {

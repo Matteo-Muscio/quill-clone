@@ -152,8 +152,8 @@ private struct ModelRow: View {
             Button("Download & Use") {
                 Task { await manager.downloadAndUse(model) }
             }
-            .disabled(manager.actionsLocked)
-            .help(lockHelp ?? "Download, verify, and use this model")
+            .disabled(actionsDisabled)
+            .help(actionUnavailableHelp ?? "Download, verify, and use this model")
         case .downloading, .verifying:
             Button {
                 manager.cancel()
@@ -167,8 +167,8 @@ private struct ModelRow: View {
             Button("Use Model") {
                 manager.activate(model)
             }
-            .disabled(manager.actionsLocked)
-            .help(lockHelp ?? "Use this model for future transcriptions")
+            .disabled(actionsDisabled)
+            .help(actionUnavailableHelp ?? "Use this model for future transcriptions")
         case .active:
             Text("Active")
                 .foregroundStyle(.secondary)
@@ -177,14 +177,22 @@ private struct ModelRow: View {
             Button("Retry") {
                 Task { await manager.downloadAndUse(model) }
             }
-            .disabled(manager.actionsLocked)
-            .help(lockHelp ?? "Retry downloading and verifying this model")
+            .disabled(actionsDisabled)
+            .help(actionUnavailableHelp ?? "Retry downloading and verifying this model")
         }
     }
 
-    private var lockHelp: String? {
-        manager.actionsLocked
-            ? "Model changes are unavailable while recording or transcribing"
-            : nil
+    private var actionsDisabled: Bool {
+        manager.actionsLocked || manager.isPreparingModel
+    }
+
+    private var actionUnavailableHelp: String? {
+        if manager.actionsLocked {
+            return "Model changes are unavailable while recording or transcribing"
+        }
+        if manager.isPreparingModel {
+            return "Model changes are unavailable while another model is being prepared"
+        }
+        return nil
     }
 }

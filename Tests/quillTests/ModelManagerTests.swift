@@ -65,6 +65,17 @@ final class ModelManagerTests: XCTestCase {
         var models: [TranscriptionModel] = []
     }
 
+    @MainActor
+    final class FailingPersistence {
+        struct TestError: LocalizedError {
+            var errorDescription: String? { "config write failed" }
+        }
+
+        func persist(_ model: TranscriptionModel) throws {
+            throw TestError()
+        }
+    }
+
     actor ProbeHarness {
         private var resultContinuation: CheckedContinuation<Bool, Never>?
         private var startContinuation: CheckedContinuation<Void, Never>?
@@ -236,6 +247,31 @@ final class ModelManagerTests: XCTestCase {
 
         XCTAssertEqual(manager.activeModel, .parakeetV2)
         XCTAssertEqual(manager.state(for: .parakeetV3), .failed("download failed"))
+    }
+
+    @MainActor
+    func testCancellingRetryAfterActivationFailureRestoresInstalledState() async {
+        let download = DownloadHarness(outcome: .suspended)
+        let persistence = FailingPersistence()
+        let manager = makeManager(
+            installed: [.parakeetV2, .parakeetV3],
+            harness: download,
+            persist: persistence.persist
+        )
+        await waitUntil { manager.state(for: .parakeetV3) == .installed }
+        manager.activate(.parakeetV3)
+        XCTAssertEqual(
+            manager.state(for: .parakeetV3),
+            .failed("config write failed")
+        )
+        let retry = Task { await manager.downloadAndUse(.parakeetV3) }
+        await waitUntil { manager.state(for: .parakeetV3) == .verifying }
+
+        manager.cancel()
+        await retry.value
+
+        XCTAssertEqual(manager.state(for: .parakeetV3), .installed)
+        XCTAssertEqual(manager.activeModel, .parakeetV2)
     }
 
     @MainActor
