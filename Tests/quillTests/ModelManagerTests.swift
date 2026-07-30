@@ -36,7 +36,8 @@ final class ModelManagerTests: XCTestCase {
                 throw TestError()
             case .suspended:
                 try await withTaskCancellationHandler {
-                    try await withCheckedThrowingContinuation { continuation in
+                    try await withCheckedThrowingContinuation {
+                        (continuation: CheckedContinuation<Void, Error>) in
                         if cancellationRequested {
                             continuation.resume(throwing: CancellationError())
                         } else {
