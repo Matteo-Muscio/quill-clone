@@ -29,4 +29,26 @@ final class AppControllerStateTests: XCTestCase {
         XCTAssertFalse(state.canStartRecording)
         XCTAssertFalse(state.modelActionsLocked)
     }
+
+    func testRecordingHandoffStaysLockedWhenTranscriptionIsEnabled() {
+        var state = AppBusyState()
+        state.isRecording = true
+
+        state.finishRecording(transcriptionEnabled: true)
+
+        XCTAssertFalse(state.isRecording)
+        XCTAssertTrue(state.isTranscribing)
+        XCTAssertTrue(state.modelActionsLocked)
+    }
+
+    func testRecordingHandoffUnlocksWhenTranscriptionIsDisabled() {
+        var state = AppBusyState()
+        state.isRecording = true
+
+        state.finishRecording(transcriptionEnabled: false)
+
+        XCTAssertFalse(state.isRecording)
+        XCTAssertFalse(state.isTranscribing)
+        XCTAssertFalse(state.modelActionsLocked)
+    }
 }

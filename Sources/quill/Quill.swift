@@ -87,6 +87,11 @@ struct AppBusyState {
     var canStartRecording: Bool {
         !isPreparingModel
     }
+
+    mutating func finishRecording(transcriptionEnabled: Bool) {
+        isRecording = false
+        isTranscribing = transcriptionEnabled
+    }
 }
 
 /// Owns the menu bar, the current recording session, and the elapsed-time
@@ -102,6 +107,7 @@ final class AppController {
     private var ticker: Timer?
     private var busyState = AppBusyState()
     private var cancellables: Set<AnyCancellable> = []
+    private var statusTask: Task<Void, Never>?
 
     init(root: URL) {
         self.root = root
@@ -112,6 +118,15 @@ final class AppController {
         })
         self.modelManager = modelManager
         self.settingsWindow = SettingsWindowController(modelManager: modelManager)
+
+        let (statuses, statusContinuation) =
+            AsyncStream<TranscriptionCoordinator.Status>.makeStream()
+        statusTask = Task { @MainActor [weak self] in
+            for await status in statuses {
+                guard let self else { return }
+                showTranscription(status)
+            }
+        }
 
         menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onOpenSettings = { [weak self] in self?.settingsWindow.show() }
@@ -130,9 +145,7 @@ final class AppController {
 
         Task { [transcription, root] in
             await transcription.setStatusHandler { status in
-                Task { @MainActor [weak self] in
-                    self?.showTranscription(status)
-                }
+                statusContinuation.yield(status)
             }
             await transcription.resumePending(root: root)
         }
@@ -141,6 +154,7 @@ final class AppController {
     /// Stop any live session cleanly (finalizing files) and exit.
     func shutdown() {
         stopSession()
+        statusTask?.cancel()
         NSApp.terminate(nil)
     }
 
@@ -181,7 +195,9 @@ final class AppController {
             "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
         ))
         self.session = nil
-        busyState.isRecording = false
+        busyState.finishRecording(
+            transcriptionEnabled: Config.transcriptionEnabled()
+        )
         syncBusyState()
         ticker?.invalidate()
         ticker = nil
