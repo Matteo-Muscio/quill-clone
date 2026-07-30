@@ -165,7 +165,7 @@ private struct ModelRow: View {
             .help("Cancel download")
         case .installed:
             Button("Use Model") {
-                Task { await manager.activate(model) }
+                manager.activate(model)
             }
             .disabled(manager.actionsLocked)
             .help(lockHelp ?? "Use this model for future transcriptions")
