@@ -111,6 +111,7 @@ actor TranscriptionCoordinator {
         while !queue.isEmpty {
             let model = selectedModel()
             let installed = (try? await isModelInstalled(model)) == true
+            guard model == selectedModel() else { continue }
             guard installed else {
                 draining = false
                 let pending = queue.count

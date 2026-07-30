@@ -186,7 +186,10 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         _ = try makeSession("2026-07-30-100002", in: root)
         let selections = Locked([
             TranscriptionModel.parakeetV3,
+            .parakeetV3,
             .parakeetV2,
+            .parakeetV2,
+            .parakeetV3,
             .parakeetV3,
         ])
         let v3FactoryCalls = Locked(0)
@@ -226,6 +229,84 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(firstReleaseCount, 1)
         XCTAssertEqual(secondPrepareCount, 1)
         XCTAssertEqual(secondTranscribeCount, 1)
+    }
+
+    func testSelectionChangeDuringProbeReprobesBeforeDequeuing() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("2026-07-30-100000", in: root)
+        let selection = Locked(TranscriptionModel.parakeetV3)
+        let probeGate = TestGate()
+        let probedModels = Locked<[TranscriptionModel]>([])
+        let factoryModels = Locked<[TranscriptionModel]>([])
+        let v2 = TestEngine(model: TranscriptionModel.parakeetV2.provenance)
+        let v3 = TestEngine(model: TranscriptionModel.parakeetV3.provenance)
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true },
+            selectedModel: { selection.value },
+            isModelInstalled: { model in
+                let isFirst = probedModels.update {
+                    $0.append(model)
+                    return $0.count == 1
+                }
+                if isFirst {
+                    await probeGate.wait()
+                }
+                return true
+            },
+            makeEngine: { model in
+                factoryModels.update { $0.append(model) }
+                return model == .parakeetV2 ? v2 : v3
+            },
+            notification: { _, _ in }
+        )
+
+        await coordinator.resumePending(root: root)
+        await probeGate.waitUntilEntered()
+        selection.set(.parakeetV2)
+        await probeGate.open()
+        await waitUntil {
+            FileManager.default.fileExists(
+                atPath: session.appendingPathComponent("transcript.json").path
+            )
+        }
+
+        XCTAssertEqual(probedModels.value, [.parakeetV3, .parakeetV2])
+        XCTAssertEqual(factoryModels.value, [.parakeetV2])
+        let v2TranscribeCount = await v2.transcribeCount
+        let v3TranscribeCount = await v3.transcribeCount
+        XCTAssertEqual(v2TranscribeCount, 1)
+        XCTAssertEqual(v3TranscribeCount, 0)
+    }
+
+    func testEnqueueDuringEngineReleaseDrainsWithoutAnotherTrigger() async throws {
+        let root = try temporaryRoot()
+        let first = try makeSession("2026-07-30-100000", in: root)
+        let releaseGate = TestGate()
+        let engine = TestEngine(
+            model: TranscriptionModel.parakeetV3.provenance,
+            releaseGate: releaseGate
+        )
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true },
+            selectedModel: { .parakeetV3 },
+            isModelInstalled: { _ in true },
+            makeEngine: { _ in engine },
+            notification: { _, _ in }
+        )
+
+        await coordinator.enqueue(first)
+        await releaseGate.waitUntilEntered()
+        let second = try makeSession("2026-07-30-100001", in: root)
+        await coordinator.enqueue(second)
+        await releaseGate.open()
+        await waitUntil {
+            FileManager.default.fileExists(
+                atPath: second.appendingPathComponent("transcript.json").path
+            )
+        }
+
+        let transcribeCount = await engine.transcribeCount
+        XCTAssertEqual(transcribeCount, 2)
     }
 
     private static func label(for status: TranscriptionCoordinator.Status) -> String {
@@ -282,15 +363,18 @@ private actor TestEngine: TranscriptionEngine {
     private(set) var releaseCount = 0
     private let prepareFails: Bool
     private let transcribeGate: TestGate?
+    private let releaseGate: TestGate?
 
     init(
         model: String = "test-model",
         prepareFails: Bool = false,
-        transcribeGate: TestGate? = nil
+        transcribeGate: TestGate? = nil,
+        releaseGate: TestGate? = nil
     ) {
         self.model = model
         self.prepareFails = prepareFails
         self.transcribeGate = transcribeGate
+        self.releaseGate = releaseGate
     }
 
     func prepare() throws {
@@ -306,8 +390,9 @@ private actor TestEngine: TranscriptionEngine {
         return [TranscriptSegment(start: 0, end: 1, text: audio.lastPathComponent)]
     }
 
-    func release() {
+    func release() async {
         releaseCount += 1
+        await releaseGate?.wait()
     }
 }
 
