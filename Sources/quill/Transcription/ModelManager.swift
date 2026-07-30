@@ -1,5 +1,4 @@
 import Combine
-import FluidAudio
 import Foundation
 
 enum ModelState: Equatable, Sendable {
@@ -24,10 +23,7 @@ final class ModelManager: ObservableObject {
         var persist: @MainActor @Sendable (TranscriptionModel) throws -> Void
 
         static let live = Operations(
-            isInstalled: { model in
-                let cache = AsrModels.defaultCacheDirectory(for: model.fluidVersion)
-                return AsrModels.modelsExist(at: cache, version: model.fluidVersion)
-            },
+            isInstalled: { ModelStore.shared.isInstalled($0) },
             downloadAndVerify: { model, progress, verifying in
                 try await ModelStore.shared.downloadAndVerify(
                     model,
