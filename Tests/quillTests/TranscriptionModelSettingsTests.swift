@@ -192,8 +192,52 @@ final class TranscriptionModelSettingsTests: XCTestCase {
             downloadAndVerify: { _, _, _, _ in }
         ))
 
-        XCTAssertTrue(store.isInstalled(.parakeetV2))
-        XCTAssertFalse(store.isInstalled(.parakeetV3))
+        let v2Installed = await store.isInstalled(.parakeetV2)
+        let v3Installed = await store.isInstalled(.parakeetV3)
+        XCTAssertTrue(v2Installed)
+        XCTAssertFalse(v3Installed)
+    }
+
+    func testInstalledProbeWaitsBehindActiveStoreOperation() async {
+        let operationGate = TestGate()
+        let probeStarted = LockedFlag()
+        let probeRan = LockedFlag()
+        let store = ModelStore(operations: .init(
+            isInstalled: { _ in
+                probeRan.set()
+                return true
+            },
+            loadCached: { _, _ in throw TestError.expected },
+            downloadAndVerify: { _, _, _, _ in
+                await operationGate.wait()
+            }
+        ))
+
+        let download = Task {
+            try? await store.downloadAndVerify(
+                .parakeetV3,
+                progress: { _ in },
+                verifying: {}
+            )
+        }
+        await operationGate.waitUntilEntered()
+        let probe = Task {
+            probeStarted.set()
+            return await store.isInstalled(.parakeetV3)
+        }
+        while !probeStarted.value {
+            await Task.yield()
+        }
+        for _ in 0..<100 {
+            await Task.yield()
+        }
+        XCTAssertFalse(probeRan.value)
+
+        await operationGate.open()
+        _ = await download.value
+        let installed = await probe.value
+        XCTAssertTrue(installed)
+        XCTAssertTrue(probeRan.value)
     }
 
     private func temporaryConfig(_ json: [String: Any]) throws -> URL {
@@ -253,5 +297,18 @@ private actor TestGate {
         isOpen = true
         continuation?.resume()
         continuation = nil
+    }
+}
+
+private final class LockedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var flag = false
+
+    var value: Bool {
+        lock.withLock { flag }
+    }
+
+    func set() {
+        lock.withLock { flag = true }
     }
 }

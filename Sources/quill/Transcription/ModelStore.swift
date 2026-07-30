@@ -64,7 +64,7 @@ actor ModelStore {
 
     static let shared = ModelStore()
 
-    private nonisolated let operations: Operations
+    private let operations: Operations
     private var operationInProgress = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -72,8 +72,10 @@ actor ModelStore {
         self.operations = operations
     }
 
-    nonisolated func isInstalled(_ model: TranscriptionModel) -> Bool {
-        operations.isInstalled(model)
+    func isInstalled(_ model: TranscriptionModel) async -> Bool {
+        await acquire()
+        defer { release() }
+        return operations.isInstalled(model)
     }
 
     func loadCached(_ model: TranscriptionModel) async throws -> AsrModels {
