@@ -18,10 +18,12 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Transcription Model") {
+            Section {
                 ForEach(TranscriptionModel.allCases) { model in
                     ModelRow(model: model, manager: modelManager)
                 }
+            } header: {
+                Text("Transcription Model")
             } footer: {
                 Text("Models run locally. Audio and transcripts do not leave this Mac.")
             }
@@ -35,7 +37,7 @@ private struct ModelRow: View {
     let model: TranscriptionModel
     @ObservedObject var manager: ModelManager
 
-    private var state: ModelManager.ModelState {
+    private var state: ModelState {
         manager.state(for: model)
     }
 
