@@ -156,7 +156,7 @@ private struct ModelRow: View {
             .help(lockHelp ?? "Download, verify, and use this model")
         case .downloading, .verifying:
             Button {
-                manager.cancelDownload()
+                manager.cancel()
             } label: {
                 Image(systemName: "xmark.circle")
             }
