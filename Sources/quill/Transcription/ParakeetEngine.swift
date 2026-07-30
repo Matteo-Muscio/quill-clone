@@ -2,18 +2,19 @@ import AVFoundation
 import FluidAudio
 import Foundation
 
-/// Parakeet TDT 0.6B v2 (English) via FluidAudio's Core ML port. Models
-/// download once into FluidAudio's managed cache (~600 MB); after that,
-/// transcription runs entirely on-device at roughly 20 seconds per hour of
-/// audio on Apple Silicon.
+/// Parakeet TDT via FluidAudio's Core ML port. The selected model must already
+/// be installed; preparing the engine never downloads or repairs model files.
 actor ParakeetEngine: TranscriptionEngine {
     enum EngineError: Error, CustomStringConvertible {
         case notPrepared
+        case modelNotInstalled(TranscriptionModel)
         case unreadableAudio(URL, Error?)
 
         var description: String {
             switch self {
             case .notPrepared: return "parakeet engine used before prepare()"
+            case .modelNotInstalled(let model):
+                return "\(model.displayName) is not installed; download it in Settings"
             case .unreadableAudio(let url, let e):
                 return "unreadable or empty audio \(url.lastPathComponent)"
                     + (e.map { ": \($0)" } ?? "")
@@ -22,13 +23,23 @@ actor ParakeetEngine: TranscriptionEngine {
     }
 
     nonisolated let name = "parakeet"
-    nonisolated let model = "parakeet-tdt-0.6b-v2-coreml"
+    nonisolated var model: String { selection.provenance }
 
+    private nonisolated let selection: TranscriptionModel
     private var manager: AsrManager?
+
+    init(model: TranscriptionModel = Config.transcriptionModel()) {
+        selection = model
+    }
 
     func prepare() async throws {
         guard manager == nil else { return }
-        let models = try await AsrModels.downloadAndLoad(version: .v2)
+        let models: AsrModels
+        do {
+            models = try await ModelStore.shared.loadCached(selection)
+        } catch ModelStoreError.notInstalled {
+            throw EngineError.modelNotInstalled(selection)
+        }
         let manager = AsrManager()
         try await manager.loadModels(models)
         self.manager = manager

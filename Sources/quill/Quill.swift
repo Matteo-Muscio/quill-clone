@@ -1,5 +1,6 @@
 import AppKit
 import ArgumentParser
+import Combine
 import Foundation
 
 @main
@@ -74,28 +75,77 @@ struct Doctor: ParsableCommand {
     }
 }
 
+struct AppBusyState {
+    var isRecording = false
+    var isTranscribing = false
+    var isPreparingModel = false
+
+    var modelActionsLocked: Bool {
+        isRecording || isTranscribing
+    }
+
+    var canStartRecording: Bool {
+        !isPreparingModel
+    }
+
+    mutating func finishRecording(transcriptionEnabled: Bool) {
+        isRecording = false
+        isTranscribing = transcriptionEnabled
+    }
+}
+
 /// Owns the menu bar, the current recording session, and the elapsed-time
 /// ticker. All state transitions happen on the main actor.
 @MainActor
 final class AppController {
     private let root: URL
     private let menuBar = MenuBarController()
-    private let transcription = TranscriptionCoordinator()
+    private let transcription: TranscriptionCoordinator
+    private let modelManager: ModelManager
+    private let settingsWindow: SettingsWindowController
     private var session: RecordingSession?
     private var ticker: Timer?
+    private var busyState = AppBusyState()
+    private var cancellables: Set<AnyCancellable> = []
+    private var statusTask: Task<Void, Never>?
 
     init(root: URL) {
         self.root = root
+        let transcription = TranscriptionCoordinator()
+        self.transcription = transcription
+        let modelManager = ModelManager(onActivation: { [transcription, root] in
+            Task { await transcription.modelDidActivate(root: root) }
+        })
+        self.modelManager = modelManager
+        self.settingsWindow = SettingsWindowController(modelManager: modelManager)
+
+        let (statuses, statusContinuation) =
+            AsyncStream<TranscriptionCoordinator.Status>.makeStream()
+        statusTask = Task { @MainActor [weak self] in
+            for await status in statuses {
+                guard let self else { return }
+                showTranscription(status)
+            }
+        }
+
         menuBar.onToggle = { [weak self] in self?.toggle() }
+        menuBar.onOpenSettings = { [weak self] in self?.settingsWindow.show() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.update(recording: false, elapsed: nil)
 
+        modelManager.$isPreparingModel
+            .sink { [weak self] (isPreparing: Bool) in
+                MainActor.assumeIsolated {
+                    self?.busyState.isPreparingModel = isPreparing
+                    self?.syncBusyState()
+                }
+            }
+            .store(in: &cancellables)
+
         Task { [transcription, root] in
             await transcription.setStatusHandler { status in
-                Task { @MainActor [weak self] in
-                    self?.showTranscription(status)
-                }
+                statusContinuation.yield(status)
             }
             await transcription.resumePending(root: root)
         }
@@ -104,6 +154,7 @@ final class AppController {
     /// Stop any live session cleanly (finalizing files) and exit.
     func shutdown() {
         stopSession()
+        statusTask?.cancel()
         NSApp.terminate(nil)
     }
 
@@ -116,10 +167,13 @@ final class AppController {
     }
 
     private func startSession() {
+        guard busyState.canStartRecording else { return }
         do {
             let newSession = try RecordingSession(root: root)
             try newSession.start()
             session = newSession
+            busyState.isRecording = true
+            syncBusyState()
             FileHandle.standardError.write(Data("● recording → \(newSession.dir.path)\n".utf8))
         } catch {
             FileHandle.standardError.write(Data("recording start failed: \(error)\n".utf8))
@@ -141,6 +195,10 @@ final class AppController {
             "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
         ))
         self.session = nil
+        busyState.finishRecording(
+            transcriptionEnabled: Config.transcriptionEnabled()
+        )
+        syncBusyState()
         ticker?.invalidate()
         ticker = nil
         menuBar.update(recording: false, elapsed: nil)
@@ -152,14 +210,37 @@ final class AppController {
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {
         switch status {
         case .idle:
+            busyState.isTranscribing = false
+            modelManager.pendingCount = 0
             menuBar.updateTranscription(nil)
         case .transcribing(let name, let queued):
+            busyState.isTranscribing = true
+            modelManager.pendingCount = 0
             menuBar.updateTranscription(
                 queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)"
             )
         case .failed(let name):
+            busyState.isTranscribing = false
+            modelManager.pendingCount = 0
             menuBar.updateTranscription("transcription failed · \(name)")
+        case .waitingForModel(let pending):
+            busyState.isTranscribing = false
+            modelManager.pendingCount = pending
+            menuBar.updateTranscription(
+                pending == 1
+                    ? "1 recording waiting for a model"
+                    : "\(pending) recordings waiting for a model"
+            )
         }
+        syncBusyState()
+    }
+
+    private func syncBusyState() {
+        modelManager.actionsLocked = busyState.modelActionsLocked
+        menuBar.updateModelPreparation(
+            busyState.isPreparingModel,
+            recording: busyState.isRecording
+        )
     }
 
     private func tick() {

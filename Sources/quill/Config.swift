@@ -14,6 +14,29 @@ import Foundation
 /// directory as its argument — after the transcript is written, or right
 /// after recording when transcription is disabled.
 enum Config {
+    enum ConfigError: Error, LocalizedError {
+        case malformedJSON(URL)
+        case invalidRoot(URL)
+        case invalidTranscription(URL)
+
+        var errorDescription: String? {
+            switch self {
+            case .malformedJSON(let url):
+                "\(url.path) is not valid JSON"
+            case .invalidRoot(let url):
+                "\(url.path) must contain a JSON object"
+            case .invalidTranscription(let url):
+                "\(url.path) transcription must be a JSON object"
+            }
+        }
+    }
+
+    private enum LoadResult {
+        case missing
+        case loaded([String: Any])
+        case invalid(ConfigError)
+    }
+
     static let path = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".config/quill/config.json")
 
@@ -38,8 +61,51 @@ enum Config {
         transcription()?["enabled"] as? Bool ?? true
     }
 
-    /// Configured engine name. Only "parakeet" ships today; the coordinator
-    /// warns and falls back for anything else.
+    /// Selected local transcription model. Missing and unknown identifiers
+    /// resolve to v3 without rewriting the configuration.
+    static func transcriptionModel(at url: URL = path) -> TranscriptionModel {
+        guard case .loaded(let root) = loadResult(at: url),
+              let transcription = root["transcription"] as? [String: Any],
+              let raw = transcription["model"] as? String,
+              let model = TranscriptionModel(rawValue: raw)
+        else { return .default }
+        return model
+    }
+
+    static func setTranscriptionModel(
+        _ model: TranscriptionModel,
+        at url: URL = path
+    ) throws {
+        var root: [String: Any]
+        switch loadResult(at: url) {
+        case .missing:
+            root = [:]
+        case .loaded(let loaded):
+            root = loaded
+        case .invalid(let error):
+            throw error
+        }
+
+        let existing = root["transcription"]
+        guard existing == nil || existing is [String: Any] else {
+            throw ConfigError.invalidTranscription(url)
+        }
+        var transcription = existing as? [String: Any] ?? [:]
+        transcription["model"] = model.rawValue
+        root["transcription"] = transcription
+
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let data = try JSONSerialization.data(
+            withJSONObject: root,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try data.write(to: url, options: .atomic)
+    }
+
+    /// Compatibility for callers migrated in the coordinator integration.
     static func transcriptionEngine() -> String {
         transcription()?["engine"] as? String ?? "parakeet"
     }
@@ -61,17 +127,37 @@ enum Config {
     /// than silently ignored — recordings landing in an unexpected place is
     /// worse than a warning.
     private static func load() -> [String: Any]? {
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        guard
-            let data = try? Data(contentsOf: path),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
+        switch loadResult(at: path) {
+        case .missing:
+            return nil
+        case .loaded(let root):
+            return root
+        case .invalid:
             FileHandle.standardError.write(Data(
                 "warning: \(path.path) is not valid JSON — ignoring config\n".utf8
             ))
             return nil
         }
-        return json
+    }
+
+    private static func loadResult(at url: URL) -> LoadResult {
+        guard FileManager.default.fileExists(atPath: url.path) else { return .missing }
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            return .invalid(.malformedJSON(url))
+        }
+        let json: Any
+        do {
+            json = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            return .invalid(.malformedJSON(url))
+        }
+        guard let root = json as? [String: Any] else {
+            return .invalid(.invalidRoot(url))
+        }
+        return .loaded(root)
     }
 
     /// Resolve the recordings root from an optional CLI override.

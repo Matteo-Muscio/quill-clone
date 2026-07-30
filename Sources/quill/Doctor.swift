@@ -1,14 +1,15 @@
 import AVFoundation
-import FluidAudio
+import Dispatch
 import Foundation
+import Synchronization
 
-enum CheckStatus {
+enum CheckStatus: Sendable {
     case ok
     case warn(String)
     case fail(String)
 }
 
-struct Check {
+struct Check: Sendable {
     let name: String
     let status: CheckStatus
     let remediation: String?
@@ -20,7 +21,7 @@ enum DoctorReport {
             checkMicrophone(),
             checkSystemAudio(),
             checkRecordingsRoot(recordingsRoot),
-            checkTranscription(),
+            checkTranscriptionSynchronously(),
         ]
     }
 
@@ -76,25 +77,55 @@ enum DoctorReport {
         return Check(name: "recordings folder", status: .ok, remediation: nil)
     }
 
-    /// Never discover a missing model after an important meeting: report
-    /// whether the parakeet models are already in FluidAudio's cache.
-    static func checkTranscription() -> Check {
+    static func checkTranscription() async -> Check {
+        let model = Config.transcriptionModel()
         guard Config.transcriptionEnabled() else {
             return Check(
-                name: "transcription",
+                name: "transcription (\(model.displayName))",
                 status: .warn("disabled in config"),
                 remediation: nil
             )
         }
-        let cache = AsrModels.defaultCacheDirectory(for: .v2)
-        if AsrModels.modelsExist(at: cache, version: .v2) {
-            return Check(name: "transcription", status: .ok, remediation: nil)
-        }
-        return Check(
-            name: "transcription",
-            status: .warn("parakeet models not downloaded (~600 MB)"),
-            remediation: "downloads automatically on first transcription — record a short test session while online"
+        return await checkTranscription(
+            model: model,
+            isInstalled: { try await ModelStore.shared.isInstalled($0) }
         )
+    }
+
+    static func checkTranscription(
+        model: TranscriptionModel,
+        isInstalled: @Sendable (TranscriptionModel) async throws -> Bool
+    ) async -> Check {
+        let name = "transcription (\(model.displayName))"
+        do {
+            if try await isInstalled(model) {
+                return Check(name: name, status: .ok, remediation: nil)
+            }
+        } catch {
+            return Check(
+                name: name,
+                status: .warn("couldn't inspect the local model cache"),
+                remediation: nil
+            )
+        }
+
+        return Check(
+            name: name,
+            status: .warn("\(model.displayName) is not downloaded (~600 MB)"),
+            remediation: "open Settings → Transcription and click Download & Use"
+        )
+    }
+
+    private static func checkTranscriptionSynchronously() -> Check {
+        let result = Mutex<Check?>(nil)
+        let completed = DispatchSemaphore(value: 0)
+        Task.detached {
+            let check = await checkTranscription()
+            result.withLock { $0 = check }
+            completed.signal()
+        }
+        completed.wait()
+        return result.withLock { $0! }
     }
 
     static func print(_ checks: [Check]) {
