@@ -281,6 +281,29 @@ final class ModelManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testDownloadedModelRetriesPersistenceWithoutDownloadingAgain() async {
+        let download = DownloadHarness(outcome: .success)
+        let persistence = ActivationPersistence()
+        let manager = makeManager(
+            harness: download,
+            persist: persistence.persist
+        )
+
+        await manager.downloadAndUse(.parakeetV3)
+        XCTAssertEqual(
+            manager.state(for: .parakeetV3),
+            .activationFailed("config write failed")
+        )
+
+        manager.activate(.parakeetV3)
+
+        let downloadCalls = await download.callCount
+        XCTAssertEqual(manager.state(for: .parakeetV3), .active)
+        XCTAssertEqual(manager.activeModel, .parakeetV3)
+        XCTAssertEqual(downloadCalls, 1)
+    }
+
+    @MainActor
     func testActionsLockedPreventsDownloadAndActivation() async {
         let harness = DownloadHarness(outcome: .success)
         let activated = ActivationSpy()

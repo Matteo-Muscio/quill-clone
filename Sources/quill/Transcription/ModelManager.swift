@@ -145,6 +145,7 @@ final class ModelManager: ObservableObject {
         id: UUID
     ) async {
         var shouldRefresh = false
+        var verificationSucceeded = false
         do {
             try await operations.downloadAndVerify(
                 model,
@@ -160,9 +161,7 @@ final class ModelManager: ObservableObject {
                 }
             )
             try Task.checkCancellation()
-            try operations.persist(model)
-            guard operationID == id else { return }
-            finishActivation(model)
+            verificationSucceeded = true
         } catch is CancellationError {
             if operationID == id {
                 setState(restoredState(previousState), for: model)
@@ -175,6 +174,15 @@ final class ModelManager: ObservableObject {
         } catch {
             if operationID == id {
                 setState(.failed(error.localizedDescription), for: model)
+            }
+        }
+
+        if verificationSucceeded, operationID == id {
+            do {
+                try operations.persist(model)
+                finishActivation(model)
+            } catch {
+                setState(.activationFailed(error.localizedDescription), for: model)
             }
         }
 
