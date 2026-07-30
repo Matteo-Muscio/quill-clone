@@ -24,13 +24,17 @@ transcription speed.
 ## How to use
 
 1. **Run it** (`quill` in a terminal, or the LaunchAgent).
-2. **Click the feather in the menu bar → Start recording.** First use prompts
+2. **Open Settings… → Transcription**, choose a model, then click
+   **Download & Use**. Parakeet v3 is the recommended default for Italian and
+   multilingual meetings; v2 is the English-focused alternative.
+3. **Click the feather in the menu bar → Start recording.** First use prompts
    for microphone and System Audio Recording permissions. While recording, the
-   icon turns red with a running elapsed counter, and macOS shows the purple
-   recording indicator.
-3. **Click → Stop recording** when the meeting ends. Transcription starts
-   automatically (the menu shows progress); a notification fires when the
-   transcript is ready.
+   feather becomes a template stop-square with a running elapsed counter,
+   following the current macOS menu-bar appearance.
+4. **Click → Stop recording** when the meeting ends. If the selected model is
+   installed, transcription starts automatically and a notification fires when
+   the transcript is ready. Otherwise, the session remains pending until a
+   model is downloaded and activated.
 
 Each session lands in `~/Recordings/<yyyy.MM.dd-HHmm>/`:
 
@@ -51,19 +55,24 @@ written is still readable.
 
 ## Transcription
 
-Built in, on-device, automatic. The default engine is **Parakeet TDT 0.6B v2**
-(English) via [FluidAudio](https://github.com/FluidInference/FluidAudio)'s
-Core ML port — roughly 20 seconds per hour of audio on Apple Silicon. Models
-(~600 MB) download once on first transcription; `quill doctor` tells you
-whether they're already cached so you're never downloading after an important
-meeting.
+Built in, on-device, automatic. The recommended default is **Parakeet TDT 0.6B
+v3**, which supports Italian and multilingual meetings with automatic language
+detection. **Parakeet TDT 0.6B v2** remains available as the English-focused
+alternative. Both run through
+[FluidAudio](https://github.com/FluidInference/FluidAudio)'s Core ML port —
+roughly 20 seconds per hour of audio on Apple Silicon.
+
+Models are about 600 MB and are never downloaded implicitly. Open
+**Settings… → Transcription**, choose a model, and click **Download & Use**;
+`quill doctor` reports whether the selected model is already cached.
 
 Each track is transcribed separately, shifted by its start offset so both
 share one clock, and merged by timestamp. Jobs run in a serial queue — you can
 start a new recording while the last one transcribes. Unfinished jobs resume
-on next launch (the filesystem is the queue: a session with `meta.json` but no
-`transcript.json` is pending). Failures append to the session's
-`transcribe.log` and never block later jobs.
+on next launch, and sessions waiting for a model resume automatically after one
+is downloaded and activated (the filesystem is the queue: a session with
+`meta.json` but no `transcript.json` is pending). Failures append to the
+session's `transcribe.log` and never block later jobs.
 
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.
@@ -75,7 +84,11 @@ Optional, at `~/.config/quill/config.json`:
 ```json
 {
   "recordings_dir": "~/Recordings",
-  "transcription": { "enabled": true, "engine": "parakeet" },
+  "transcription": {
+    "enabled": true,
+    "engine": "parakeet",
+    "model": "parakeet-v3"
+  },
   "on_stop": "my-hook"
 }
 ```
@@ -83,6 +96,8 @@ Optional, at `~/.config/quill/config.json`:
 - `recordings_dir` — where sessions land. Resolution order: `--out` flag >
   config > `~/Recordings`.
 - `transcription.enabled` — set `false` to just record.
+- `transcription.model` — selected local model: `parakeet-v3` (recommended
+  Italian/multilingual default) or `parakeet-v2` (English-focused alternative).
 - `mic_voice_processing` — Apple's echo cancellation on the mic (default off).
   Set `true` when recording meetings through the speakers, so playback doesn't
   bleed into the mic track and get transcribed twice as "me". The trade: while
@@ -121,7 +136,7 @@ quill install --uninstall
   per-process picker if it bothers you).
 - If recordings come out silent, check System Settings → Privacy & Security →
   Screen & System Audio Recording.
-- Parakeet v2 is English-only. Other languages will come with the Whisper
-  engine.
+- Parakeet v2 is English-only; choose the recommended v3 model for Italian and
+  multilingual meetings.
 - The binary embeds its Info.plist (`__TEXT,__info_plist`) so TCC can
   attribute permissions to quill itself when running as a LaunchAgent.

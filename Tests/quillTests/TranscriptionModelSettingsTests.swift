@@ -94,6 +94,38 @@ final class TranscriptionModelSettingsTests: XCTestCase {
         )
     }
 
+    func testDoctorChecksAndReportsOnlyTheSelectedModel() async {
+        let recorder = EventRecorder()
+
+        let check = await DoctorReport.checkTranscription(
+            model: .parakeetV2,
+            isInstalled: { model in
+                await recorder.append(model.rawValue)
+                return true
+            }
+        )
+
+        let checkedModels = await recorder.values
+        XCTAssertEqual(checkedModels, ["parakeet-v2"])
+        XCTAssertEqual(check.name, "transcription (Parakeet TDT 0.6B v2)")
+        if case .ok = check.status {
+        } else {
+            XCTFail("expected installed selected model to pass")
+        }
+    }
+
+    func testDoctorDirectsMissingModelToSettings() async {
+        let check = await DoctorReport.checkTranscription(
+            model: .parakeetV3,
+            isInstalled: { _ in false }
+        )
+
+        XCTAssertEqual(
+            check.remediation,
+            "open Settings → Transcription and click Download & Use"
+        )
+    }
+
     func testCachedLoadsRequestOfflineAccess() async {
         let recorder = EventRecorder()
         let mode = LockedValue(false)
