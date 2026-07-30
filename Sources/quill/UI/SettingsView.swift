@@ -61,6 +61,9 @@ private struct ModelRow: View {
                     }
                 }
 
+                Text(model.providerName)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text(model.recommendation)
                 Text(model.languageSummary)
                     .foregroundStyle(.secondary)
@@ -88,26 +91,32 @@ private struct ModelRow: View {
             Image(systemName: "arrow.down.circle")
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Not downloaded")
+                .help("This model is not downloaded")
         case .downloading:
             Image(systemName: "arrow.down.circle.fill")
                 .foregroundStyle(.tint)
                 .accessibilityLabel("Downloading")
+                .help("This model is downloading")
         case .verifying:
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(.tint)
                 .accessibilityLabel("Verifying")
+                .help("Quill is verifying this model")
         case .installed:
             Image(systemName: "checkmark.circle")
                 .foregroundStyle(.secondary)
                 .accessibilityLabel("Downloaded")
+                .help("This model is downloaded and ready to use")
         case .active:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
                 .accessibilityLabel("Active model")
+                .help("This model is active")
         case .failed:
             Image(systemName: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
                 .accessibilityLabel("Model preparation failed")
+                .help("Model preparation failed")
         }
     }
 
