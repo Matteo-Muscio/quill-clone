@@ -11,6 +11,7 @@ final class MenuBarController {
     private let toggleItem: NSMenuItem
 
     var onToggle: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
 
@@ -47,6 +48,15 @@ final class MenuBarController {
 
         menu.addItem(.separator())
 
+        let settings = NSMenuItem(
+            title: "Settings…",
+            action: #selector(openSettingsClicked),
+            keyEquivalent: ","
+        )
+        menu.addItem(settings)
+
+        menu.addItem(.separator())
+
         let quit = NSMenuItem(
             title: "Quit quill",
             action: #selector(quitClicked),
@@ -54,7 +64,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openFolder, quit] {
+        for item in [toggleItem, openFolder, settings, quit] {
             item.target = self
         }
 
@@ -68,14 +78,25 @@ final class MenuBarController {
         }
     }
 
-    /// Reflect recording state in the icon tint and menu item titles. The
-    /// menu bar shows only the feather (red while recording); the elapsed
+    /// Reflect recording state in the icon and menu item titles. The
+    /// menu bar shows only the template icon; the elapsed
     /// counter lives in the menu's state label. Call once a second while
     /// recording.
     func update(recording: Bool, elapsed: String?) {
         stateLabel.title = recording ? "● recording · \(elapsed ?? "0:00")" : "idle"
         toggleItem.title = recording ? "Stop recording" : "Start recording"
-        statusItem.button?.contentTintColor = recording ? .systemRed : nil
+        let image = recording ? Self.recordingImage() : Self.featherImage()
+        image?.isTemplate = true
+        statusItem.button?.image = image
+    }
+
+    /// Prevent a new recording while model download or verification is active.
+    /// An existing recording can always be stopped.
+    func updateModelPreparation(_ isPreparing: Bool, recording: Bool) {
+        toggleItem.isEnabled = recording || !isPreparing
+        toggleItem.toolTip = isPreparing && !recording
+            ? "Recording is unavailable while a transcription model is being prepared"
+            : nil
     }
 
     /// Show transcription progress/failure as a second status line in the
@@ -108,7 +129,15 @@ final class MenuBarController {
         return image
     }
 
+    private static func recordingImage() -> NSImage? {
+        NSImage(
+            systemSymbolName: "stop.fill",
+            accessibilityDescription: "Quill is recording"
+        )
+    }
+
     @objc private func toggleClicked() { onToggle?() }
+    @objc private func openSettingsClicked() { onOpenSettings?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
     @objc private func quitClicked() { onQuit?() }
 }
