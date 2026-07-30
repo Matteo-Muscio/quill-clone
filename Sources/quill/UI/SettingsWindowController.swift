@@ -24,7 +24,7 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func show() {
-        NSApp.activate(ignoringOtherApps: true)
+        NSApp.activate()
         window?.makeKeyAndOrderFront(nil)
     }
 }

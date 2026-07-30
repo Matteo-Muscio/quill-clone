@@ -75,6 +75,8 @@ final class MenuBarController {
             image?.isTemplate = true
             button.image = image
             button.imagePosition = .imageLeft
+            button.setAccessibilityLabel("Quill")
+            button.setAccessibilityValue("Idle")
         }
     }
 
@@ -88,6 +90,10 @@ final class MenuBarController {
         let image = recording ? Self.recordingImage() : Self.featherImage()
         image?.isTemplate = true
         statusItem.button?.image = image
+        statusItem.button?.setAccessibilityLabel("Quill")
+        statusItem.button?.setAccessibilityValue(
+            recording ? "Recording, \(elapsed ?? "0:00")" : "Idle"
+        )
     }
 
     /// Prevent a new recording while model download or verification is active.
