@@ -4,7 +4,7 @@
 
 **Goal:** Add a native macOS model-management window for Parakeet v3 and v2, make downloads explicit, resume pending transcripts after activation, and show a native stop-square while recording.
 
-**Architecture:** Keep the existing AppKit menu-bar shell and host a focused SwiftUI Settings view in one reusable `NSWindow`. A small typed model catalog and main-actor manager own model metadata, cache state, download progress, and activation; the existing coordinator consumes the active cached model and waits without downloading when none is available.
+**Architecture:** Keep the existing AppKit menu-bar shell and host a focused SwiftUI Settings view in one reusable `NSWindow`. A small typed model catalog and main-actor manager own model metadata, cache state, download progress, and activation. One actor serializes FluidAudio cache access, forcing cached transcription loads offline and permitting network access only for explicit download and verification; the existing coordinator waits without dequeueing when no installed model is available.
 
 **Tech Stack:** Swift 6, AppKit, SwiftUI, Swift Package Manager, FluidAudio/Core ML, XCTest, GitHub Actions/CLI for publishing.
 
@@ -182,6 +182,14 @@ func testSetModelPreservesUnknownKeys() throws {
 Add one private helper in the test class that creates a unique temporary
 directory, writes the supplied JSON, and registers teardown removal.
 
+Add tests which preserve the original bytes and require an error for:
+
+- Malformed JSON.
+- A valid JSON non-object root.
+- A non-object `transcription` value.
+
+Also test that a genuinely missing file may be created.
+
 **Step 2: Run the tests to verify they fail**
 
 Run:
@@ -197,11 +205,14 @@ Expected: compilation fails because the new `Config` APIs do not exist.
 In `Config.swift`:
 
 - Replace `transcriptionEngine()` with `transcriptionModel(at:)`.
-- Make `load(at:)` accept a URL defaulting to `Config.path`.
+- Replace the optional loader with a result that distinguishes `.missing`,
+  `.loaded([String: Any])`, and `.invalid(ConfigError)`.
 - Add `setTranscriptionModel(_:at:) throws`.
-- Read the existing root dictionary, mutate only
-  `root["transcription"]["model"]`, create the parent directory, and write
-  `.prettyPrinted`, `.sortedKeys`, and `.atomic`.
+- Create a new root only for `.missing`. For `.invalid`, throw without writing.
+- Treat a present non-object `transcription` value as invalid rather than
+  replacing it.
+- For a loaded object, mutate only `root["transcription"]["model"]`, create the
+  parent directory, and write `.prettyPrinted`, `.sortedKeys`, and `.atomic`.
 - Resolve missing or invalid model identifiers to `.default`.
 - Keep the existing `engine` key for backward compatibility but stop using it
   for model selection.
@@ -210,9 +221,10 @@ Core implementation:
 
 ```swift
 static func transcriptionModel(at url: URL = path) -> TranscriptionModel {
-    guard
-        let raw = (load(at: url)?["transcription"] as? [String: Any])?["model"] as? String,
-        let model = TranscriptionModel(rawValue: raw)
+    guard case .loaded(let root) = loadResult(at: url),
+          let transcription = root["transcription"] as? [String: Any],
+          let raw = transcription["model"] as? String,
+          let model = TranscriptionModel(rawValue: raw)
     else { return .default }
     return model
 }
@@ -221,8 +233,20 @@ static func setTranscriptionModel(
     _ model: TranscriptionModel,
     at url: URL = path
 ) throws {
-    var root = load(at: url) ?? [:]
-    var transcription = root["transcription"] as? [String: Any] ?? [:]
+    var root: [String: Any]
+    switch loadResult(at: url) {
+    case .missing:
+        root = [:]
+    case .loaded(let loaded):
+        root = loaded
+    case .invalid(let error):
+        throw error
+    }
+    let existing = root["transcription"]
+    guard existing == nil || existing is [String: Any] else {
+        throw ConfigError.invalidTranscription
+    }
+    var transcription = existing as? [String: Any] ?? [:]
     transcription["model"] = model.rawValue
     root["transcription"] = transcription
     try FileManager.default.createDirectory(
@@ -257,6 +281,7 @@ git commit -m "feat: persist transcription model"
 ### Task 3: Load the selected cached model without downloading
 
 **Files:**
+- Create: `Sources/quill/Transcription/ModelStore.swift`
 - Modify: `Sources/quill/Transcription/ParakeetEngine.swift`
 - Modify: `Sources/quill/Transcription/TranscriptionCoordinator.swift`
 - Modify: `Tests/quillTests/TranscriptionModelSettingsTests.swift`
@@ -288,7 +313,73 @@ swift test --filter TranscriptionModelSettingsTests/testSelectedModelControlsPro
 
 Expected: compilation fails because `ParakeetEngine` has no model initializer.
 
-**Step 3: Make `ParakeetEngine` model-aware**
+**Step 3: Add a serialized FluidAudio model store**
+
+Create an actor used by both transcription and explicit model management:
+
+```swift
+actor ModelStore {
+    static let shared = ModelStore()
+
+    func loadCached(_ model: TranscriptionModel) async throws -> AsrModels {
+        let previous = ModelHub.offlineMode
+        ModelHub.offlineMode = true
+        defer { ModelHub.offlineMode = previous }
+
+        let version = model.fluidVersion
+        let cache = AsrModels.defaultCacheDirectory(for: version)
+        guard AsrModels.modelsExist(at: cache, version: version) else {
+            throw ModelStoreError.notInstalled(model)
+        }
+        return try await AsrModels.load(from: cache, version: version)
+    }
+
+    func downloadAndVerify(
+        _ model: TranscriptionModel,
+        progress: @escaping ProgressHandler,
+        verifying: @escaping @Sendable () -> Void
+    ) async throws {
+        let previous = ModelHub.offlineMode
+        ModelHub.offlineMode = false
+        defer { ModelHub.offlineMode = previous }
+
+        let cache = try await AsrModels.download(
+            version: model.fluidVersion,
+            progressHandler: progress
+        )
+        verifying()
+        let models = try await AsrModels.load(
+            from: cache,
+            version: model.fluidVersion
+        )
+        let manager = AsrManager()
+        do {
+            try await manager.loadModels(models)
+            await manager.cleanup()
+        } catch {
+            await manager.cleanup()
+            throw error
+        }
+    }
+}
+```
+
+The actor serialization is required because `ModelHub.offlineMode` is global.
+No other code may call `AsrModels.load`, `download`, or `downloadAndLoad`
+directly. Give `ModelStore` an internal initializer accepting async load and
+download/verify closures, with production defaults wrapping FluidAudio. Tests
+construct a non-singleton store with actor-backed fakes, so serialization and
+offline/online intent are verified without touching global state or the
+network.
+
+Add tests with injected store operations proving that:
+
+- Cached loads request offline behavior.
+- Explicit downloads request online behavior.
+- A cached load and explicit download cannot overlap.
+- A cache-load failure does not invoke the explicit download operation.
+
+**Step 4: Make `ParakeetEngine` model-aware**
 
 Change the engine to store `TranscriptionModel`:
 
@@ -304,19 +395,11 @@ init(model: TranscriptionModel) {
 Replace `downloadAndLoad(version: .v2)` in `prepare()` with:
 
 ```swift
-let version = selection.fluidVersion
-let cache = AsrModels.defaultCacheDirectory(for: version)
-guard AsrModels.modelsExist(at: cache, version: version) else {
-    throw EngineError.modelNotInstalled(selection)
-}
-let models = try await AsrModels.load(
-    from: cache,
-    version: version
-)
+let models = try await ModelStore.shared.loadCached(selection)
 ```
 
 Add a user-facing `modelNotInstalled` engine error. The transcription path must
-never call `downloadAndLoad`.
+never call `downloadAndLoad` and FluidAudio cache recovery must remain offline.
 
 Update `TranscriptionCoordinator.preparedEngine()` to construct:
 
@@ -326,7 +409,7 @@ let engine = ParakeetEngine(model: Config.transcriptionModel())
 
 Delete the unknown-engine warning and fallback.
 
-**Step 4: Run focused tests and build**
+**Step 5: Run focused tests and build**
 
 Run:
 
@@ -337,10 +420,10 @@ swift build -c release
 
 Expected: tests pass and the release build completes.
 
-**Step 5: Commit**
+**Step 6: Commit**
 
 ```bash
-git add Sources/quill/Transcription/ParakeetEngine.swift Sources/quill/Transcription/TranscriptionCoordinator.swift Tests/quillTests/TranscriptionModelSettingsTests.swift
+git add Sources/quill/Transcription/ModelStore.swift Sources/quill/Transcription/ParakeetEngine.swift Sources/quill/Transcription/TranscriptionCoordinator.swift Tests/quillTests/TranscriptionModelSettingsTests.swift
 git commit -m "feat: load selected cached model"
 ```
 
@@ -356,10 +439,12 @@ Use injected async operations so tests do not download models. Cover:
 
 - Initial installed state comes from the cache probe.
 - Progress moves the selected row into downloading state.
+- Download completion moves the row into an indeterminate verifying state.
 - Success persists and activates the model.
 - Cancellation restores the previous state.
 - Failure exposes retry state and does not change the active selection.
-- `actionsLocked` prevents download, activation, and deletion.
+- `actionsLocked` prevents download and activation.
+- Progress delivered from a non-main queue is bridged onto the main actor.
 
 Representative test:
 
@@ -395,6 +480,7 @@ Create a `@MainActor final class ModelManager: ObservableObject` with:
 enum ModelState: Equatable {
     case notInstalled
     case downloading(Double)
+    case verifying
     case installed
     case active
     case failed(String)
@@ -408,6 +494,8 @@ The manager owns:
 - `@Published var actionsLocked`
 - One download `Task` at a time
 - A callback invoked after successful activation
+- Main-actor creation, replacement, cancellation, and clearing of the download
+  task
 
 Inject only the side effects required for deterministic tests:
 
@@ -415,18 +503,31 @@ Inject only the side effects required for deterministic tests:
 struct Operations {
     var isInstalled: @Sendable (TranscriptionModel) -> Bool
     var downloadAndVerify:
-        @Sendable (TranscriptionModel, @escaping @Sendable (Double) -> Void) async throws -> Void
-    var persist: @Sendable (TranscriptionModel) throws -> Void
-    var delete: @Sendable (TranscriptionModel) throws -> Void
+        @Sendable (
+            TranscriptionModel,
+            @escaping @Sendable (Double) -> Void,
+            @escaping @Sendable () -> Void
+        ) async throws -> Void
+    var persist: @MainActor @Sendable (TranscriptionModel) throws -> Void
 }
 ```
 
 The production download operation calls
-`AsrModels.downloadAndLoad(version:progressHandler:)`, forwards
-`progress.fractionCompleted` to the main actor, loads the returned models into
-an `AsrManager`, calls `cleanup()`, and then allows persistence. The production
-delete operation removes only `AsrModels.defaultCacheDirectory(for:)` for the
-inactive model.
+`ModelStore.shared.downloadAndVerify`. FluidAudio progress arrives on an
+unspecified queue, so bridge every update with `Task { @MainActor in ... }`.
+Keep displayed transfer progress monotonic with `max(previous, incoming)`;
+the store calls a separate `verifying` callback after `AsrModels.download`
+returns and before cached model loading begins. Show `.verifying` from that
+callback until the async store operation returns. Only then persist and
+activate.
+
+Handle `CancellationError` separately from other failures so cancellation
+restores the prior installed or unavailable state without showing a warning.
+Use an actor-backed test harness for values mutated by asynchronous operations;
+do not mutate captured arrays from `@Sendable` closures.
+
+Model deletion is intentionally absent from v1 because FluidAudio's default
+cache may be shared with other applications.
 
 **Step 4: Run tests**
 
@@ -450,23 +551,31 @@ git commit -m "feat: manage local transcription models"
 **Files:**
 - Modify: `Sources/quill/Transcription/TranscriptionCoordinator.swift`
 - Modify: `Sources/quill/Quill.swift`
+- Modify: `Sources/quill/UI/MenuBarController.swift`
 - Modify: `Tests/quillTests/TranscriptionModelSettingsTests.swift`
 
-**Step 1: Write failing queue-state tests**
+**Step 1: Write failing actor-level queue tests**
 
-Extract a small pure decision that is testable without audio:
+Create temporary session folders with `meta.json` and inject cache and
+transcription operations. Prove that a missing model:
 
-```swift
-func testMissingModelWaitsWithoutCompletingSession() {
-    XCTAssertEqual(
-        TranscriptionCoordinator.queueDecision(modelInstalled: false),
-        .waitForModel
-    )
-}
-```
+- Does not remove the pending item from the actor's queue.
+- Does not create `transcript.json`.
+- Does not publish failure or send a failure notification.
+- Publishes one waiting transition even if `resumePending` is called again.
+- Clears `draining`.
 
-Also test that an installed model returns `.transcribe`, and that activation
-causes the pending-resume callback to run exactly once.
+Then install the fake model, trigger activation, and prove that the retained
+session runs exactly once, produces its completion marker, and leaves no queue
+duplicates. A pure `queueDecision` test is insufficient.
+
+Add main-actor tests for both overlap orders:
+
+- Recording starts, then transcription becomes idle.
+- Transcription starts, then recording stops.
+
+In both cases `actionsLocked` remains the derived value of the two independent
+busy states.
 
 **Step 2: Run tests to verify they fail**
 
@@ -487,21 +596,34 @@ Add:
 case waitingForModel(pending: Int)
 ```
 
-to coordinator `Status`. Before draining, resolve the selected model and check
-its FluidAudio cache. If absent:
+to coordinator `Status`. At the top of every drain iteration, resolve the
+selected model and check its FluidAudio cache **before** `queue.removeFirst()`.
+If absent:
 
 - Leave session folders without `transcript.json`.
-- Stop the drain instead of repeatedly requeueing.
-- Publish `.waitingForModel`.
+- Retain the complete in-memory queue.
+- Set `draining = false` before returning.
+- Publish `.waitingForModel` only when transitioning into that state.
 - Send one notification per transition into waiting.
 
-Add `modelDidActivate(root:)` to call `resumePending(root:)`. Wire the model
-manager's activation callback in `AppController` to that method. Update
+Add `modelDidActivate(root:)` to call `resumePending(root:)`, deduplicate
+filesystem sessions against the retained queue, and restart draining. Wire the
+model manager's activation callback in `AppController` to that method. Update
 `showTranscription` to display “transcription waiting for a model”.
 
-Set `modelManager.actionsLocked` whenever recording is active or coordinator
-status is `.transcribing`. Keep it locked for the complete transcription job,
-not merely model loading.
+Keep separate `isRecording` and `isTranscribing` values in `AppController`.
+After either changes, call one method which derives:
+
+```swift
+modelManager.actionsLocked = isRecording || isTranscribing
+```
+
+Do not assign the lock independently from callbacks.
+
+Expose `ModelManager.isPreparingModel`. Disable **Start recording** while a
+download or verification is already active, with menu help explaining why.
+This prevents model verification and activation from completing during audio
+capture. Recording that is already active continues normally.
 
 **Step 4: Run tests and release build**
 
@@ -517,7 +639,7 @@ Expected: all tests and the release build pass.
 **Step 5: Commit**
 
 ```bash
-git add Sources/quill/Transcription/TranscriptionCoordinator.swift Sources/quill/Quill.swift Tests/quillTests/TranscriptionModelSettingsTests.swift
+git add Sources/quill/Transcription/TranscriptionCoordinator.swift Sources/quill/Quill.swift Sources/quill/UI/MenuBarController.swift Tests/quillTests/TranscriptionModelSettingsTests.swift
 git commit -m "feat: wait for an installed model"
 ```
 
@@ -533,7 +655,9 @@ git commit -m "feat: wait for an installed model"
 
 Create `SettingsWindowController` using `NSHostingController` and one retained
 `NSWindow`. Configure a standard titled, closable window, autosave its frame,
-and reuse it on subsequent **Settings…** actions.
+and reuse it on subsequent **Settings…** actions. Its `show()` method must call
+`makeKeyAndOrderFront(nil)` and activate `NSApp` so the accessory application
+brings the window forward.
 
 Use a system settings-style title and native toolbar/window materials. Do not
 hard-code background, text, accent, light, or dark colors.
@@ -558,14 +682,15 @@ Each row contains:
 
 - Model name and a v3 **Recommended** badge.
 - Recommendation, language summary, size, and `lock.shield` local-only label.
-- `arrow.down.circle`, determinate `ProgressView`, `checkmark.circle`,
+- `arrow.down.circle`, determinate download `ProgressView`, indeterminate
+  **Verifying…** progress, `checkmark.circle`,
   `checkmark.circle.fill`, or `exclamationmark.triangle` according to state.
-- **Download & Use**, **Use Model**, **Retry**, cancel, and inactive-model
-  deletion actions.
+- **Download & Use**, **Use Model**, **Retry**, and cancel actions.
 
 Every icon-only control receives `.accessibilityLabel(...)` and `.help(...)`.
-Use a native confirmation dialog before deletion. Show a compact waiting banner
-when coordinator status is `.waitingForModel`.
+Model deletion is not present in v1. Publish `pendingCount` from the main-actor
+settings state, update it from `AppController.showTranscription`, and show a
+compact waiting banner whenever the count is greater than zero.
 
 **Step 3: Add the menu entry and app wiring**
 
@@ -699,10 +824,32 @@ git commit -m "docs: explain local model selection"
 **Files:**
 - No source changes expected
 
-**Step 1: Preserve the baseline binary**
+**Step 1: Preserve and document the baseline binary**
 
-Copy the currently installed baseline binary to a temporary rollback location
-outside the repository before replacing it.
+Use one explicit durable rollback location:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/quill/rollback/pre-model-picker"
+test ! -e "$HOME/Library/Application Support/quill/rollback/pre-model-picker/quill"
+install -m 755 \
+  "$HOME/Library/Application Support/quill/bin/quill" \
+  "$HOME/Library/Application Support/quill/rollback/pre-model-picker/quill"
+shasum -a 256 \
+  "$HOME/Library/Application Support/quill/rollback/pre-model-picker/quill" \
+  > "$HOME/Library/Application Support/quill/rollback/pre-model-picker/SHA256"
+```
+
+Expected: the immutable baseline binary and checksum exist outside the
+repository.
+
+Record these exact restore commands before installing the branch:
+
+```bash
+install -m 755 \
+  "$HOME/Library/Application Support/quill/rollback/pre-model-picker/quill" \
+  "$HOME/Library/Application Support/quill/bin/quill"
+"$HOME/Library/Application Support/quill/bin/quill" install --launch-at-login
+```
 
 **Step 2: Install the branch build per-user**
 
@@ -715,6 +862,16 @@ install -m 755 .build/release/quill "$HOME/Library/Application Support/quill/bin
 
 Expected: LaunchAgent bootstrap succeeds and the new process remains running.
 
+Verify the installer did not select an unexpected `/usr/local/bin/quill`:
+
+```bash
+plutil -p "$HOME/Library/LaunchAgents/com.digimata.quill.plist"
+pgrep -fl "$HOME/Library/Application Support/quill/bin/quill"
+```
+
+Expected: `ProgramArguments[0]` and the running process both use the per-user
+binary.
+
 **Step 3: Verify native UI with Computer Use**
 
 Use the computer-use skill to verify:
@@ -723,6 +880,7 @@ Use the computer-use skill to verify:
 - Native materials and semantic colors follow current macOS appearance.
 - Model state icons include accessibility labels.
 - Actions disable while recording and transcribing.
+- Starting a recording is disabled during model download and verification.
 - The idle feather changes to a native stop square during recording.
 
 Do not accept unexpected privacy prompts without the user's authorization.
@@ -737,7 +895,7 @@ With user-approved network and storage use:
 4. Confirm a session made before model installation resumes afterward.
 5. Download and activate v2.
 6. Record a short English sample and verify v2 provenance.
-7. Switch to v3 and delete inactive v2 after confirmation.
+7. Switch back to v3 and verify both cached models remain selectable.
 
 Expected: audio stays local, pending sessions remain intact, and each transcript
 records the selected concrete model.

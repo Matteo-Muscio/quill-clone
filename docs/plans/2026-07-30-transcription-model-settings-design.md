@@ -8,7 +8,7 @@ macOS meeting recorder. This release includes:
 - A SwiftUI Settings window hosted by the existing AppKit menu-bar app.
 - Parakeet TDT v3 as the recommended multilingual default.
 - Parakeet TDT v2 as the English-focused alternative.
-- Explicit model download, activation, cancellation, and deletion.
+- Explicit model download, activation, and cancellation.
 - Pending-session recovery when no transcription model is installed.
 - A recording-state menu-bar icon that changes from the feather to a stop
   square.
@@ -43,8 +43,8 @@ cards:
 Each card shows the model name, provider, recommendation, language summary,
 approximate download size, local-only privacy status, and model state. The
 primary action changes between **Download & Use**, progress and cancellation,
-**Use Model**, **Active**, and **Retry**. An installed inactive model may be
-deleted; the active model must be switched away from before deletion.
+**Use Model**, **Active**, and **Retry**. Model deletion is deferred because
+FluidAudio's default cache may be shared with other applications.
 
 ## Native macOS appearance
 
@@ -83,6 +83,12 @@ FluidAudio remains the only inference dependency. The transcription engine
 accepts the selected model version instead of hard-coding v2, and transcript
 provenance continues to record the concrete model identifier.
 
+One serialized model-store boundary owns all FluidAudio cache access. Explicit
+download and verification runs online through this boundary, while
+transcription loads run with FluidAudio's global offline mode enabled. The
+boundary prevents these operations from overlapping and guarantees that
+transcription cannot recover a damaged cache by downloading implicitly.
+
 ## Download and activation
 
 Model downloads are always explicit. Quill does not begin a roughly 600 MB
@@ -98,9 +104,15 @@ download merely because a meeting ended.
 6. Resume pending sessions.
 
 A cancelled or failed operation leaves the previous active model unchanged.
-Download, cancellation, activation, and deletion are disabled while Quill is
-recording or transcribing. Disabled controls explain the reason through help
-text.
+Download and activation are disabled while Quill is recording or transcribing.
+Starting a recording is disabled while download or verification is active, so
+Core ML verification and activation cannot complete during capture. Disabled
+controls explain the reason through help text.
+
+FluidAudio reports download and model-loading phases separately, so the UI
+shows determinate transfer progress followed by an indeterminate
+**Verifying…** phase. Completion is shown only after verification and
+configuration persistence succeed.
 
 ## Pending transcription
 
@@ -114,6 +126,11 @@ notification directing the user to install a model. After a model is installed
 and activated, the coordinator rescans the recordings root and resumes pending
 sessions automatically.
 
+The coordinator checks model availability before removing a session from its
+in-memory queue. If the model is absent, it retains the complete queue, clears
+its draining flag, and publishes one waiting transition. Activation restarts
+the retained queue without adding duplicates.
+
 ## Error handling
 
 - Download and verification failures appear inline on the affected model with
@@ -121,8 +138,8 @@ sessions automatically.
 - Cancellation returns the model to its prior installed or unavailable state.
 - Configuration write failure prevents activation and preserves the previous
   selection.
-- Deletion is unavailable for the active model and requires confirmation for
-  an inactive model.
+- Missing configuration may be created, but malformed JSON or invalid root and
+  transcription values are never overwritten.
 - Recording output remains untouched by model-management failures.
 
 ## Validation
@@ -141,7 +158,7 @@ Manual verification covers:
 
 - Release build and the focused test suite.
 - `quill doctor` for both selected models.
-- Download, cancellation, retry, activation, switching, and deletion.
+- Download, cancellation, retry, activation, and switching.
 - A short English transcription with v2 and an Italian transcription with v3.
 - Pending-session resumption after installing the first model.
 - Settings in Light, Dark, Auto, Clear, Tinted, and Reduce Transparency modes.
