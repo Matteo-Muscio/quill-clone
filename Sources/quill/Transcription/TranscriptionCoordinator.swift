@@ -12,13 +12,44 @@ actor TranscriptionCoordinator {
         case idle
         case transcribing(session: String, queued: Int)
         case failed(session: String)
+        case waitingForModel(pending: Int)
     }
 
     private var queue: [URL] = []
     private var draining = false
+    private var waitingForModel = false
     private var engine: TranscriptionEngine?
     private var lastFailure: String?
     private var statusHandler: (@Sendable (Status) -> Void)?
+    private let transcriptionEnabled: @Sendable () -> Bool
+    private let selectedModel: @Sendable () -> TranscriptionModel
+    private let isModelInstalled: @Sendable (TranscriptionModel) async throws -> Bool
+    private let makeEngine: @Sendable (TranscriptionModel) -> TranscriptionEngine
+    private let notification: @Sendable (String, String) -> Void
+
+    init(
+        transcriptionEnabled: @escaping @Sendable () -> Bool = {
+            Config.transcriptionEnabled()
+        },
+        selectedModel: @escaping @Sendable () -> TranscriptionModel = {
+            Config.transcriptionModel()
+        },
+        isModelInstalled: @escaping @Sendable (TranscriptionModel) async throws -> Bool = {
+            try await ModelStore.shared.isInstalled($0)
+        },
+        makeEngine: @escaping @Sendable (TranscriptionModel) -> TranscriptionEngine = {
+            ParakeetEngine(model: $0)
+        },
+        notification: @escaping @Sendable (String, String) -> Void = {
+            notifyUser(title: $0, body: $1)
+        }
+    ) {
+        self.transcriptionEnabled = transcriptionEnabled
+        self.selectedModel = selectedModel
+        self.isModelInstalled = isModelInstalled
+        self.makeEngine = makeEngine
+        self.notification = notification
+    }
 
     func setStatusHandler(_ handler: @escaping @Sendable (Status) -> Void) {
         statusHandler = handler
@@ -27,7 +58,7 @@ actor TranscriptionCoordinator {
     /// Queue a finished session. With transcription disabled in config, the
     /// on_stop hook still fires — it just gets an untranscribed folder.
     func enqueue(_ sessionDir: URL) {
-        guard Config.transcriptionEnabled() else {
+        guard transcriptionEnabled() else {
             runHook(for: sessionDir)
             return
         }
@@ -39,7 +70,7 @@ actor TranscriptionCoordinator {
     /// but were never transcribed. Folder names sort chronologically, so
     /// oldest-first is a name sort.
     func resumePending(root: URL) {
-        guard Config.transcriptionEnabled() else { return }
+        guard transcriptionEnabled() else { return }
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil
         ) else { return }
@@ -62,6 +93,10 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
+    func modelDidActivate(root: URL) {
+        resumePending(root: root)
+    }
+
     // MARK: -
 
     private func drainIfIdle() {
@@ -73,18 +108,34 @@ actor TranscriptionCoordinator {
 
     private func drain() async {
         while !queue.isEmpty {
+            let model = selectedModel()
+            let installed = (try? await isModelInstalled(model)) == true
+            guard installed else {
+                draining = false
+                if !waitingForModel {
+                    waitingForModel = true
+                    publish(.waitingForModel(pending: queue.count))
+                    notification(
+                        "quill — transcription waiting",
+                        "\(queue.count) recording(s) waiting — open Settings to download a model"
+                    )
+                }
+                return
+            }
+
+            waitingForModel = false
             let dir = queue.removeFirst()
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
-                try await transcribe(dir)
-                notifyUser(title: "quill — transcript ready", body: dir.lastPathComponent)
+                try await transcribe(dir, model: model)
+                notification("quill — transcript ready", dir.lastPathComponent)
                 runHook(for: dir)
             } catch {
                 log(dir, "transcription failed: \(error)")
                 lastFailure = dir.lastPathComponent
-                notifyUser(
-                    title: "quill — transcription failed",
-                    body: "\(dir.lastPathComponent) — see transcribe.log"
+                notification(
+                    "quill — transcription failed",
+                    "\(dir.lastPathComponent) — see transcribe.log"
                 )
             }
         }
@@ -97,9 +148,9 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
-    private func transcribe(_ dir: URL) async throws {
+    private func transcribe(_ dir: URL, model: TranscriptionModel) async throws {
         let meta = try SessionMeta.read(from: dir)
-        let engine = try await preparedEngine()
+        let engine = try await preparedEngine(for: model)
 
         var merged: [Transcript.Segment] = []
         for track in meta.tracks {
@@ -140,15 +191,16 @@ actor TranscriptionCoordinator {
         log(dir, "done — \(merged.count) segments")
     }
 
-    private func preparedEngine() async throws -> TranscriptionEngine {
-        if let engine { return engine }
-        let configured = Config.transcriptionEngine()
-        if configured != "parakeet" {
-            FileHandle.standardError.write(Data(
-                "warning: unknown transcription engine \"\(configured)\" — using parakeet\n".utf8
-            ))
+    private func preparedEngine(for model: TranscriptionModel) async throws
+        -> TranscriptionEngine
+    {
+        if let engine {
+            if engine.model == model.provenance {
+                return engine
+            }
+            await engine.release()
         }
-        let engine = ParakeetEngine()
+        let engine = makeEngine(model)
         try await engine.prepare()
         self.engine = engine
         return engine
