@@ -16,8 +16,9 @@ actor TranscriptionCoordinator {
     }
 
     private var queue: [URL] = []
+    private var inFlight: URL?
     private var draining = false
-    private var waitingForModel = false
+    private var waitingPendingCount: Int?
     private var engine: TranscriptionEngine?
     private var lastFailure: String?
     private var statusHandler: (@Sendable (Status) -> Void)?
@@ -82,7 +83,7 @@ actor TranscriptionCoordinator {
                     && !fm.fileExists(atPath: $0.appendingPathComponent("transcript.json").path)
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in pending where !queue.contains(dir) {
+        for dir in pending where dir != inFlight && !queue.contains(dir) {
             queue.append(dir)
         }
         if !pending.isEmpty {
@@ -112,9 +113,13 @@ actor TranscriptionCoordinator {
             let installed = (try? await isModelInstalled(model)) == true
             guard installed else {
                 draining = false
-                if !waitingForModel {
-                    waitingForModel = true
+                let pending = queue.count
+                let startedWaiting = waitingPendingCount == nil
+                if waitingPendingCount != pending {
+                    waitingPendingCount = pending
                     publish(.waitingForModel(pending: queue.count))
+                }
+                if startedWaiting {
                     notification(
                         "quill — transcription waiting",
                         "\(queue.count) recording(s) waiting — open Settings to download a model"
@@ -123,8 +128,9 @@ actor TranscriptionCoordinator {
                 return
             }
 
-            waitingForModel = false
+            waitingPendingCount = nil
             let dir = queue.removeFirst()
+            inFlight = dir
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
                 try await transcribe(dir, model: model)
@@ -138,6 +144,7 @@ actor TranscriptionCoordinator {
                     "\(dir.lastPathComponent) — see transcribe.log"
                 )
             }
+            inFlight = nil
         }
         await engine?.release()
         engine = nil
@@ -198,6 +205,7 @@ actor TranscriptionCoordinator {
             if engine.model == model.provenance {
                 return engine
             }
+            self.engine = nil
             await engine.release()
         }
         let engine = makeEngine(model)
