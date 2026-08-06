@@ -116,6 +116,20 @@ final class MicRecoveryStateTests: XCTestCase {
         XCTAssertFalse(claim.claimBuffer())
     }
 
+    func testTrackStartUsesInitialRecoverySilenceBeforeFirstRealBuffer() {
+        let gapStart = Date(timeIntervalSince1970: 1_000)
+        let firstRealBuffer = gapStart.addingTimeInterval(2)
+
+        XCTAssertEqual(
+            MicRecorder.trackStart(initialSilenceAt: gapStart, firstRealBufferAt: firstRealBuffer),
+            gapStart
+        )
+        XCTAssertEqual(
+            MicRecorder.trackStart(initialSilenceAt: nil, firstRealBufferAt: firstRealBuffer),
+            firstRealBuffer
+        )
+    }
+
     func testFinishClosesAnOpenInterruption() {
         var state = MicRecoveryState()
         state.captureLost(at: start)

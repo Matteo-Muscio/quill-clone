@@ -120,14 +120,15 @@ final class MicRecorder: @unchecked Sendable {
     private let acceptsTapWrites = Atomic<Bool>(false)
     private let firstBufferAtBits = Atomic<UInt64>(0)
     private let lastBufferAtBits = Atomic<UInt64>(0)
-    private let awaitingRecoveryBuffer = Atomic<Bool>(false)
-    private let generationBits = Atomic<UInt64>(0)
     private let engineEpochBits = Atomic<UInt64>(0)
     private let recoveryClaim = RecoveryClaim(awaiting: false)
+    private let fileAccessClaim = Atomic<Bool>(false)
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
-    private(set) var firstBufferAt: Date?
+    var firstBufferAt: Date? {
+        Self.date(from: firstBufferAtBits.load(ordering: .acquiring))
+    }
     private(set) var recoveryState = MicRecoveryState()
     private(set) var initialInput: InputDescription?
     var onHealthChange: (@MainActor @Sendable (MicCaptureHealth) -> Void)?
@@ -153,28 +154,27 @@ final class MicRecorder: @unchecked Sendable {
         guard !isRecording else { return }
         self.url = url
         recoveryGeneration &+= 1
-        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
         recoveryState = MicRecoveryState()
         initialInput = nil
         activeInput = nil
         recordingStartedAt = Date()
         recoveryGapStartedAt = nil
         recoveryDeadline = nil
-        firstBufferAt = nil
         firstBufferAtBits.store(0, ordering: .releasing)
         lastBufferAtBits.store(0, ordering: .releasing)
         hasCapturedUsefulAudio.store(false, ordering: .releasing)
-        awaitingRecoveryBuffer.store(false, ordering: .releasing)
         advanceEngineEpoch()
         engine = AVAudioEngine()
         do {
-            try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+            try withFileAccessBarrier {
+                try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+            }
             try attach(voiceProcessing: Config.micVoiceProcessing())
             isRecording = true
             startWatchdog()
         } catch {
             tearDownEngine()
-            file = nil
+            withFileAccessBarrier { file = nil }
             throw error
         }
     }
@@ -184,16 +184,16 @@ final class MicRecorder: @unchecked Sendable {
         guard isRecording else { return }
         isRecording = false
         recoveryGeneration &+= 1
-        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
         watchdog?.invalidate()
         watchdog = nil
         acceptsTapWrites.store(false, ordering: .releasing)
         recoveryState.finish(at: Date())
         tearDownEngine()
-        file = nil
-        silenceWrittenThrough = nil
+        withFileAccessBarrier {
+            file = nil
+            silenceWrittenThrough = nil
+        }
         hasCapturedUsefulAudio.store(false, ordering: .releasing)
-        awaitingRecoveryBuffer.store(false, ordering: .releasing)
     }
 
     // MARK: -
@@ -300,7 +300,9 @@ final class MicRecorder: @unchecked Sendable {
 
         do {
             if let gap {
-                try writeSilence(for: gap)
+                try withFileAccessBarrier {
+                    try writeSilence(for: gap)
+                }
             }
         } catch {
             engine.stop()
@@ -340,13 +342,13 @@ final class MicRecorder: @unchecked Sendable {
         let checkFrames = Int(tapFormat.sampleRate)
         let tapEpoch = currentEngineEpoch
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: tapFormat) { [weak self] buffer, _ in
-            guard let self,
-                  self.isCurrentEngine(tapEpoch),
+            guard let self, self.tryClaimFileAccess() else { return }
+            defer { self.releaseFileAccess() }
+            guard self.isCurrentEngine(tapEpoch),
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
             let capturedAtBits = Self.currentDateBits()
             self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
-            self.recordFirstBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
 
             if !self.livenessSettled {
                 let frames = Int(buffer.frameLength)
@@ -372,6 +374,7 @@ final class MicRecorder: @unchecked Sendable {
                     try self.writeRecoveryResidualSilence(through: capturedAtBits, epoch: tapEpoch)
                 }
                 try self.write(buffer, with: converter, into: output, to: file, epoch: tapEpoch)
+                self.recordTrackStartIfNeeded(at: capturedAtBits)
                 if recovered {
                     self.finishRecoveryAfterBuffer(at: capturedAtBits, epoch: tapEpoch)
                 }
@@ -408,19 +411,20 @@ final class MicRecorder: @unchecked Sendable {
         }
         let tapEpoch = currentEngineEpoch
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: inputFormat) { [weak self] buffer, _ in
-            guard let self,
-                  self.isCurrentEngine(tapEpoch),
+            guard let self, self.tryClaimFileAccess() else { return }
+            defer { self.releaseFileAccess() }
+            guard self.isCurrentEngine(tapEpoch),
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
             let capturedAtBits = Self.currentDateBits()
             self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
-            self.recordFirstBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
             let recovered = self.claimRecoveryBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
             do {
                 if recovered {
                     try self.writeRecoveryResidualSilence(through: capturedAtBits, epoch: tapEpoch)
                 }
                 try self.write(buffer, with: converter, into: output, to: file, epoch: tapEpoch)
+                self.recordTrackStartIfNeeded(at: capturedAtBits)
                 if recovered {
                     self.finishRecoveryAfterBuffer(at: capturedAtBits, epoch: tapEpoch)
                 }
@@ -528,11 +532,9 @@ final class MicRecorder: @unchecked Sendable {
         recoveryGapStartedAt = recoveryGapStartedAt ?? gapStart
         recoveryDeadline = Date().addingTimeInterval(3)
         recoveryGeneration &+= 1
-        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
         let generation = recoveryGeneration
         emitHealthChange(generation: generation)
         acceptsTapWrites.store(false, ordering: .releasing)
-        awaitingRecoveryBuffer.store(true, ordering: .releasing)
         tearDownEngine()
         recoveryClaim.reset()
         scheduleRecoveryDeadline(generation: generation)
@@ -566,7 +568,6 @@ final class MicRecorder: @unchecked Sendable {
               recoveryClaim.claimTimeout() else { return }
         recoveryState.recoveryTimedOut()
         emitHealthChange(generation: generation)
-        awaitingRecoveryBuffer.store(false, ordering: .releasing)
         acceptsTapWrites.store(false, ordering: .releasing)
         tearDownEngine()
     }
@@ -608,21 +609,32 @@ final class MicRecorder: @unchecked Sendable {
         engineEpochBits.load(ordering: .acquiring) == epoch
     }
 
-    private func recordFirstBufferIfNeeded(at bits: UInt64, epoch: UInt64) {
-        guard firstBufferAtBits.compareExchange(
+    private func tryClaimFileAccess() -> Bool {
+        fileAccessClaim.compareExchange(
+            expected: false,
+            desired: true,
+            ordering: .acquiringAndReleasing
+        ).exchanged
+    }
+
+    private func releaseFileAccess() {
+        fileAccessClaim.store(false, ordering: .releasing)
+    }
+
+    private func withFileAccessBarrier<R>(_ body: () throws -> R) rethrows -> R {
+        while !tryClaimFileAccess() {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        defer { releaseFileAccess() }
+        return try body()
+    }
+
+    private func recordTrackStartIfNeeded(at bits: UInt64) {
+        _ = firstBufferAtBits.compareExchange(
             expected: 0,
             desired: bits,
             ordering: .acquiringAndReleasing
-        ).exchanged else { return }
-        let generation = generationBits.load(ordering: .acquiring)
-        DispatchQueue.main.async { [weak self] in
-            guard let self,
-                  self.isRecording,
-                  self.isCurrentEngine(epoch),
-                  self.generationBits.load(ordering: .acquiring) == generation,
-                  self.firstBufferAt == nil else { return }
-            self.firstBufferAt = Self.date(from: bits)
-        }
+        )
     }
 
     private func claimRecoveryBufferIfNeeded(at bits: UInt64, epoch: UInt64) -> Bool {
@@ -654,7 +666,6 @@ final class MicRecorder: @unchecked Sendable {
                   self.recoveryState.health == .reconnecting else { return }
             self.recoveryState.recoveryTimedOut()
             self.emitHealthChange()
-            self.awaitingRecoveryBuffer.store(false, ordering: .releasing)
             self.acceptsTapWrites.store(false, ordering: .releasing)
             self.tearDownEngine()
         }
@@ -687,6 +698,10 @@ final class MicRecorder: @unchecked Sendable {
 
     static func inputRouteChanged(from active: InputDescription?, to current: InputDescription?) -> Bool {
         active != current
+    }
+
+    static func trackStart(initialSilenceAt: Date?, firstRealBufferAt: Date?) -> Date? {
+        initialSilenceAt ?? firstRealBufferAt
     }
 
     private static func date(from bits: UInt64) -> Date? {
@@ -890,6 +905,9 @@ final class MicRecorder: @unchecked Sendable {
                 }
             }
             try file.write(from: buffer)
+            if let trackStart = Self.trackStart(initialSilenceAt: start, firstRealBufferAt: nil) {
+                recordTrackStartIfNeeded(at: trackStart.timeIntervalSinceReferenceDate.bitPattern)
+            }
             remaining -= frames
             writtenThrough = writtenThrough.addingTimeInterval(Double(frames) / format.sampleRate)
             silenceWrittenThrough = writtenThrough
@@ -909,25 +927,30 @@ final class MicRecorder: @unchecked Sendable {
         tearDownEngine()
         let recreateFile = !hasCapturedUsefulAudio.load(ordering: .acquiring)
         if recreateFile {
-            file = nil
-            firstBufferAt = nil
-            firstBufferAtBits.store(0, ordering: .releasing)
-            silenceWrittenThrough = nil
-            if let url {
-                try? FileManager.default.removeItem(at: url)
+            withFileAccessBarrier {
+                file = nil
+                firstBufferAtBits.store(0, ordering: .releasing)
+                silenceWrittenThrough = nil
+                if let url {
+                    try? FileManager.default.removeItem(at: url)
+                }
             }
         }
         engine = AVAudioEngine()
         do {
             if recreateFile {
-                try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+                try withFileAccessBarrier {
+                    try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+                }
             }
             try attach(voiceProcessing: false)
         } catch {
             FileHandle.standardError.write(Data(
                 "mic raw fallback failed: \(error) — session continues without mic track\n".utf8
             ))
-            if recreateFile { file = nil }
+            if recreateFile {
+                withFileAccessBarrier { file = nil }
+            }
         }
     }
 }
