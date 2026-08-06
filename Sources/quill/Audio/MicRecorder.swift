@@ -222,10 +222,7 @@ final class MicRecorder: @unchecked Sendable {
             }
         }
         let inputFormat = input.outputFormat(forBus: 0)
-        let inputDescription = Self.defaultInputDescription(
-            sampleRate: inputFormat.sampleRate,
-            channelCount: inputFormat.channelCount
-        )
+        let inputDescription = Self.defaultInputDescription()
         if initialInput == nil { initialInput = inputDescription }
         activeInput = inputDescription
 
@@ -424,7 +421,7 @@ final class MicRecorder: @unchecked Sendable {
         let now = Date()
 
         if recoveryState.health == .failed {
-            if let currentInput = Self.defaultInputDescription(), currentInput != activeInput {
+            if Self.inputRouteChanged(from: activeInput, to: Self.defaultInputDescription()) {
                 beginRecovery(at: recoveryGapStartedAt ?? now, retryingFailedRecovery: true)
             }
             return
@@ -432,11 +429,7 @@ final class MicRecorder: @unchecked Sendable {
 
         if recoveryState.health == .reconnecting {
             if let recoveryDeadline, now >= recoveryDeadline {
-                recoveryState.recoveryTimedOut()
-                emitHealthChange()
-                awaitingRecoveryBuffer.store(false, ordering: .releasing)
-                acceptsTapWrites.store(false, ordering: .releasing)
-                tearDownEngine()
+                failRecovery(generation: recoveryGeneration)
             }
             return
         }
@@ -473,36 +466,55 @@ final class MicRecorder: @unchecked Sendable {
             guard recoveryState.health == .healthy else { return }
             recoveryState.captureLost(at: gapStart)
         }
-        emitHealthChange()
-
         recoveryGapStartedAt = recoveryGapStartedAt ?? gapStart
         recoveryDeadline = Date().addingTimeInterval(3)
         recoveryGeneration &+= 1
         generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
         let generation = recoveryGeneration
+        emitHealthChange(generation: generation)
         acceptsTapWrites.store(false, ordering: .releasing)
         awaitingRecoveryBuffer.store(true, ordering: .releasing)
         tearDownEngine()
+        scheduleRecoveryDeadline(generation: generation)
 
         DispatchQueue.main.async { [weak self] in
-            self?.attachRecovery(generation: generation)
+            guard let self, !self.attachRecovery(generation: generation) else { return }
+            self.scheduleRecoveryRetry(generation: generation)
         }
+    }
+
+    private func scheduleRecoveryRetry(generation: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
             guard let self,
                   self.isRecording,
                   self.recoveryGeneration == generation,
-                  self.recoveryState.health == .reconnecting,
-                  self.awaitingRecoveryBuffer.load(ordering: .acquiring) else { return }
-            self.acceptsTapWrites.store(false, ordering: .releasing)
-            self.tearDownEngine()
-            self.attachRecovery(generation: generation)
+                  self.recoveryState.health == .reconnecting else { return }
+            _ = self.attachRecovery(generation: generation)
         }
     }
 
-    private func attachRecovery(generation: Int) {
+    private func scheduleRecoveryDeadline(generation: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(3)) { [weak self] in
+            self?.failRecovery(generation: generation)
+        }
+    }
+
+    private func failRecovery(generation: Int) {
         guard isRecording,
               recoveryGeneration == generation,
               recoveryState.health == .reconnecting else { return }
+        recoveryState.recoveryTimedOut()
+        emitHealthChange(generation: generation)
+        awaitingRecoveryBuffer.store(false, ordering: .releasing)
+        acceptsTapWrites.store(false, ordering: .releasing)
+        tearDownEngine()
+    }
+
+    @discardableResult
+    private func attachRecovery(generation: Int) -> Bool {
+        guard isRecording,
+              recoveryGeneration == generation,
+              recoveryState.health == .reconnecting else { return false }
         engine = AVAudioEngine()
         do {
             let gap = DateInterval(start: recoveryGapStartedAt ?? Date(), end: Date())
@@ -510,9 +522,11 @@ final class MicRecorder: @unchecked Sendable {
                 voiceProcessing: Config.micVoiceProcessing(),
                 writingRecoverySilenceFor: gap
             )
+            return true
         } catch {
             tearDownEngine()
             FileHandle.standardError.write(Data("mic route recovery attempt failed: \(error)\n".utf8))
+            return false
         }
     }
 
@@ -559,10 +573,16 @@ final class MicRecorder: @unchecked Sendable {
         }
     }
 
-    private func emitHealthChange() {
+    private func emitHealthChange(generation: Int? = nil) {
         let callback = onHealthChange
         let health = recoveryState.health
-        Task { @MainActor in callback?(health) }
+        let expectedGeneration = generation ?? recoveryGeneration
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.isRecording,
+                  self.recoveryGeneration == expectedGeneration else { return }
+            callback?(health)
+        }
     }
 
     private static func currentDateBits() -> UInt64 {
@@ -578,15 +598,17 @@ final class MicRecorder: @unchecked Sendable {
         now.timeIntervalSince(lastBufferAt ?? startedAt) >= timeout
     }
 
+    static func inputRouteChanged(from active: InputDescription?, to current: InputDescription?) -> Bool {
+        guard let active, let current else { return false }
+        return active != current
+    }
+
     private static func date(from bits: UInt64) -> Date? {
         guard bits != 0 else { return nil }
         return Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits))
     }
 
-    private static func defaultInputDescription(
-        sampleRate: Double? = nil,
-        channelCount: UInt32? = nil
-    ) -> InputDescription? {
+    private static func defaultInputDescription() -> InputDescription? {
         var deviceID = AudioObjectID(kAudioObjectUnknown)
         var deviceSize = UInt32(MemoryLayout<AudioObjectID>.size)
         var deviceAddress = AudioObjectPropertyAddress(
@@ -619,11 +641,42 @@ final class MicRecorder: @unchecked Sendable {
 
         guard let name = stringProperty(kAudioObjectPropertyName),
               let uid = stringProperty(kAudioDevicePropertyDeviceUID) else { return nil }
+        var nominalSampleRate: Float64 = 0
+        var sampleRateSize = UInt32(MemoryLayout<Float64>.size)
+        var sampleRateAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &sampleRateAddress,
+            0,
+            nil,
+            &sampleRateSize,
+            &nominalSampleRate
+        ) == noErr else { return nil }
+
+        var streamFormat = AudioStreamBasicDescription()
+        var streamFormatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var streamFormatAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamFormat,
+            mScope: kAudioObjectPropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &streamFormatAddress,
+            0,
+            nil,
+            &streamFormatSize,
+            &streamFormat
+        ) == noErr else { return nil }
         return InputDescription(
             name: name,
             uid: uid,
-            sampleRate: sampleRate ?? 0,
-            channelCount: channelCount ?? 0
+            sampleRate: nominalSampleRate,
+            channelCount: streamFormat.mChannelsPerFrame
         )
     }
 

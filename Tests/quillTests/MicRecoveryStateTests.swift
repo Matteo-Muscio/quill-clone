@@ -86,6 +86,21 @@ final class MicRecoveryStateTests: XCTestCase {
         ))
     }
 
+    func testFailedRoutePollingRetriesOnlyWhenRouteIdentityChanges() {
+        let active = InputDescription(
+            name: "AirPods",
+            uid: "airpods",
+            sampleRate: 24_000,
+            channelCount: 1
+        )
+
+        XCTAssertFalse(MicRecorder.inputRouteChanged(from: active, to: active))
+        XCTAssertTrue(MicRecorder.inputRouteChanged(
+            from: active,
+            to: .init(name: "AirPods", uid: "airpods", sampleRate: 48_000, channelCount: 1)
+        ))
+    }
+
     func testFinishClosesAnOpenInterruption() {
         var state = MicRecoveryState()
         state.captureLost(at: start)
