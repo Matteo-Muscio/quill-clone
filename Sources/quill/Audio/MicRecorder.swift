@@ -1,6 +1,49 @@
 import AVFoundation
 import Foundation
 
+enum MicCaptureHealth: String, Codable, Equatable, Sendable {
+    case healthy
+    case reconnecting
+    case failed
+}
+
+struct MicInterruption: Codable, Equatable, Sendable {
+    let startedAt: Date
+    var endedAt: Date?
+}
+
+struct MicRecoveryState: Equatable, Sendable {
+    private(set) var health: MicCaptureHealth = .healthy
+    private(set) var interruptions: [MicInterruption] = []
+
+    mutating func captureLost(at date: Date) {
+        guard interruptions.last?.endedAt != nil || interruptions.isEmpty else {
+            health = .reconnecting
+            return
+        }
+        interruptions.append(.init(startedAt: date, endedAt: nil))
+        health = .reconnecting
+    }
+
+    mutating func recoveryTimedOut() { health = .failed }
+    mutating func retryRecovery() { health = .reconnecting }
+
+    mutating func captureResumed(at date: Date) {
+        closeOpenInterruption(at: date)
+        health = .healthy
+    }
+
+    mutating func finish(at date: Date) {
+        closeOpenInterruption(at: date)
+    }
+
+    private mutating func closeOpenInterruption(at date: Date) {
+        guard let index = interruptions.indices.last,
+              interruptions[index].endedAt == nil else { return }
+        interruptions[index].endedAt = date
+    }
+}
+
 /// Records the default input device to a file via AVAudioEngine, encoding AAC
 /// mono. Buffers stream straight to disk — nothing is held in memory, so
 /// session length is unbounded.
