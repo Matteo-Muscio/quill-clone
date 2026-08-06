@@ -134,8 +134,11 @@ actor TranscriptionCoordinator {
             inFlight = dir
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
-                try await transcribe(dir, model: model)
-                notification("quill — transcript ready", dir.lastPathComponent)
+                let partial = try await transcribe(dir, model: model)
+                let body = partial
+                    ? "\(dir.lastPathComponent) — microphone audio is incomplete"
+                    : dir.lastPathComponent
+                notification("quill — transcript ready", body)
                 runHook(for: dir)
             } catch {
                 log(dir, "transcription failed: \(error)")
@@ -156,7 +159,7 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
-    private func transcribe(_ dir: URL, model: TranscriptionModel) async throws {
+    private func transcribe(_ dir: URL, model: TranscriptionModel) async throws -> Bool {
         let meta = try SessionMeta.read(from: dir)
         let engine = try await preparedEngine(for: model)
 
@@ -193,10 +196,12 @@ actor TranscriptionCoordinator {
             engine: engine.name,
             model: engine.model,
             created_at: ISO8601DateFormatter().string(from: Date()),
+            partial: meta.microphonePartial,
             segments: merged
         )
         try transcript.write(to: dir)
         log(dir, "done — \(merged.count) segments")
+        return meta.microphonePartial
     }
 
     private func preparedEngine(for model: TranscriptionModel) async throws
@@ -257,6 +262,7 @@ private struct SessionMeta {
     }
 
     let tracks: [Track]
+    let microphonePartial: Bool
 
     enum MetaError: Error, CustomStringConvertible {
         case unreadable(URL)
@@ -286,7 +292,11 @@ private struct SessionMeta {
         if let system = files["system"] {
             tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0))
         }
-        return SessionMeta(tracks: tracks)
+        let microphone = json["microphone"] as? [String: Any]
+        return SessionMeta(
+            tracks: tracks,
+            microphonePartial: microphone?["partial"] as? Bool ?? false
+        )
     }
 }
 
@@ -303,6 +313,7 @@ private struct Transcript: Codable {
     let engine: String
     let model: String
     let created_at: String
+    let partial: Bool
     let segments: [Segment]
 
     /// Write transcript.json and render transcript.md. Both writes are atomic
@@ -318,7 +329,14 @@ private struct Transcript: Codable {
     }
 
     private func rendered(title: String) -> String {
-        var lines = ["# \(title)", "", "engine: \(engine) (\(model))", ""]
+        var lines = ["# \(title)", ""]
+        if partial {
+            lines += [
+                "Warning: microphone capture was incomplete and some of the user's speech may be missing.",
+                "",
+            ]
+        }
+        lines += ["engine: \(engine) (\(model))", ""]
         for seg in segments {
             lines.append("**[\(Self.clock(seg.start_ms))] \(seg.speaker):** \(seg.text)")
             lines.append("")

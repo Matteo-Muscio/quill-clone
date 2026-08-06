@@ -309,6 +309,44 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(transcribeCount, 2)
     }
 
+    func testPartialMicrophoneSessionSurfacesWarningInTranscriptAndNotification() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("2026-07-30-100000", in: root, microphonePartial: true)
+        let notifications = Locked<[(String, String)]>([])
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true },
+            selectedModel: { .parakeetV3 },
+            isModelInstalled: { _ in true },
+            makeEngine: { _ in TestEngine() },
+            notification: { title, body in notifications.update { $0.append((title, body)) } }
+        )
+
+        await coordinator.enqueue(session)
+        await waitUntil {
+            FileManager.default.fileExists(
+                atPath: session.appendingPathComponent("transcript.json").path
+            )
+        }
+
+        XCTAssertEqual(notifications.value.count, 1)
+        XCTAssertEqual(notifications.value.first?.0, "quill — transcript ready")
+        XCTAssertEqual(
+            notifications.value.first?.1,
+            "2026-07-30-100000 — microphone audio is incomplete"
+        )
+        let transcriptData = try Data(contentsOf: session.appendingPathComponent("transcript.json"))
+        let transcript = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: transcriptData) as? [String: Any]
+        )
+        XCTAssertEqual(transcript["partial"] as? Bool, true)
+        let markdown = try String(
+            contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8
+        )
+        XCTAssertTrue(markdown.contains(
+            "microphone capture was incomplete and some of the user's speech may be missing"
+        ))
+    }
+
     private static func label(for status: TranscriptionCoordinator.Status) -> String {
         switch status {
         case .idle:
@@ -330,10 +368,17 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         return root
     }
 
-    private func makeSession(_ name: String, in root: URL) throws -> URL {
+    private func makeSession(
+        _ name: String,
+        in root: URL,
+        microphonePartial: Bool = false
+    ) throws -> URL {
         let session = root.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: session, withIntermediateDirectories: true)
-        let meta = ["files": ["mic": "mic.caf"]]
+        let meta: [String: Any] = [
+            "files": ["mic": "mic.caf"],
+            "microphone": ["partial": microphonePartial],
+        ]
         let data = try JSONSerialization.data(withJSONObject: meta)
         try data.write(to: session.appendingPathComponent("meta.json"))
         try Data([1]).write(to: session.appendingPathComponent("mic.caf"))
