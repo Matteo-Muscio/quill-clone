@@ -99,6 +99,21 @@ final class MicRecoveryStateTests: XCTestCase {
             from: active,
             to: .init(name: "AirPods", uid: "airpods", sampleRate: 48_000, channelCount: 1)
         ))
+        XCTAssertTrue(MicRecorder.inputRouteChanged(from: nil, to: active))
+    }
+
+    func testRecoveredBufferClaimPreventsTimeoutClaim() {
+        let claim = RecoveryClaim()
+
+        XCTAssertTrue(claim.claimBuffer())
+        XCTAssertFalse(claim.claimTimeout())
+    }
+
+    func testTimeoutClaimPreventsRecoveredBufferClaim() {
+        let claim = RecoveryClaim()
+
+        XCTAssertTrue(claim.claimTimeout())
+        XCTAssertFalse(claim.claimBuffer())
     }
 
     func testFinishClosesAnOpenInterruption() {

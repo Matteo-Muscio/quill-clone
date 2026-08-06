@@ -56,6 +56,34 @@ struct InputDescription: Equatable, Sendable {
     let channelCount: UInt32
 }
 
+final class RecoveryClaim: @unchecked Sendable {
+    private let awaiting: Atomic<Bool>
+
+    init(awaiting: Bool = true) {
+        self.awaiting = Atomic(awaiting)
+    }
+
+    func reset() {
+        awaiting.store(true, ordering: .releasing)
+    }
+
+    func claimBuffer() -> Bool {
+        awaiting.compareExchange(
+            expected: true,
+            desired: false,
+            ordering: .acquiringAndReleasing
+        ).exchanged
+    }
+
+    func claimTimeout() -> Bool {
+        awaiting.compareExchange(
+            expected: true,
+            desired: false,
+            ordering: .acquiringAndReleasing
+        ).exchanged
+    }
+}
+
 /// Records the default input device to a file via AVAudioEngine, encoding AAC
 /// mono. Buffers stream straight to disk — nothing is held in memory, so
 /// session length is unbounded.
@@ -72,12 +100,14 @@ final class MicRecorder: @unchecked Sendable {
         case engineStartFailed(Error)
         case fileCreationFailed(Error)
         case formatUnsupported(AVAudioFormat)
+        case staleEngine
 
         var description: String {
             switch self {
             case .engineStartFailed(let e): return "mic engine start failed: \(e)"
             case .fileCreationFailed(let e): return "mic file creation failed: \(e)"
             case .formatUnsupported(let f): return "can't downmix mic format \(f)"
+            case .staleEngine: return "mic engine was replaced before its buffer could be written"
             }
         }
     }
@@ -92,6 +122,8 @@ final class MicRecorder: @unchecked Sendable {
     private let lastBufferAtBits = Atomic<UInt64>(0)
     private let awaitingRecoveryBuffer = Atomic<Bool>(false)
     private let generationBits = Atomic<UInt64>(0)
+    private let engineEpochBits = Atomic<UInt64>(0)
+    private let recoveryClaim = RecoveryClaim(awaiting: false)
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -105,6 +137,7 @@ final class MicRecorder: @unchecked Sendable {
     private var recoveryGapStartedAt: Date?
     private var recoveryDeadline: Date?
     private var recoveryGeneration = 0
+    private var currentEngineEpoch: UInt64 = 0
     private var configurationObserver: NSObjectProtocol?
     private var watchdog: Timer?
 
@@ -132,6 +165,7 @@ final class MicRecorder: @unchecked Sendable {
         lastBufferAtBits.store(0, ordering: .releasing)
         hasCapturedUsefulAudio.store(false, ordering: .releasing)
         awaitingRecoveryBuffer.store(false, ordering: .releasing)
+        advanceEngineEpoch()
         engine = AVAudioEngine()
         do {
             try createFile(for: engine.inputNode.outputFormat(forBus: 0))
@@ -304,14 +338,15 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.formatUnsupported(outputFormat)
         }
         let checkFrames = Int(tapFormat.sampleRate)
+        let tapEpoch = currentEngineEpoch
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: tapFormat) { [weak self] buffer, _ in
             guard let self,
+                  self.isCurrentEngine(tapEpoch),
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
             let capturedAtBits = Self.currentDateBits()
             self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
-            self.recordFirstBufferIfNeeded(at: capturedAtBits)
-            self.recordRecoveryBufferIfNeeded(at: capturedAtBits)
+            self.recordFirstBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
 
             if !self.livenessSettled {
                 let frames = Int(buffer.frameLength)
@@ -331,9 +366,19 @@ final class MicRecorder: @unchecked Sendable {
                 }
             }
 
+            let recovered = self.claimRecoveryBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
             do {
-                try self.write(buffer, with: converter, into: output, to: file)
+                if recovered {
+                    try self.writeRecoveryResidualSilence(through: capturedAtBits, epoch: tapEpoch)
+                }
+                try self.write(buffer, with: converter, into: output, to: file, epoch: tapEpoch)
+                if recovered {
+                    self.finishRecoveryAfterBuffer(at: capturedAtBits, epoch: tapEpoch)
+                }
             } catch {
+                if recovered {
+                    self.failClaimedRecovery(epoch: tapEpoch)
+                }
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
@@ -361,18 +406,29 @@ final class MicRecorder: @unchecked Sendable {
         ) else {
             throw RecorderError.formatUnsupported(outputFormat)
         }
+        let tapEpoch = currentEngineEpoch
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: inputFormat) { [weak self] buffer, _ in
             guard let self,
+                  self.isCurrentEngine(tapEpoch),
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
             let capturedAtBits = Self.currentDateBits()
             self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
-            self.recordFirstBufferIfNeeded(at: capturedAtBits)
-            self.recordRecoveryBufferIfNeeded(at: capturedAtBits)
+            self.recordFirstBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
+            let recovered = self.claimRecoveryBufferIfNeeded(at: capturedAtBits, epoch: tapEpoch)
             do {
-                try self.write(buffer, with: converter, into: output, to: file)
+                if recovered {
+                    try self.writeRecoveryResidualSilence(through: capturedAtBits, epoch: tapEpoch)
+                }
+                try self.write(buffer, with: converter, into: output, to: file, epoch: tapEpoch)
+                if recovered {
+                    self.finishRecoveryAfterBuffer(at: capturedAtBits, epoch: tapEpoch)
+                }
                 self.hasCapturedUsefulAudio.store(true, ordering: .releasing)
             } catch {
+                if recovered {
+                    self.failClaimedRecovery(epoch: tapEpoch)
+                }
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
@@ -383,6 +439,7 @@ final class MicRecorder: @unchecked Sendable {
     private func observeConfigurationChanges(for observedEngine: AVAudioEngine) {
         removeConfigurationObserver()
         let generation = recoveryGeneration
+        let epoch = currentEngineEpoch
         configurationObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: observedEngine,
@@ -392,7 +449,7 @@ final class MicRecorder: @unchecked Sendable {
             // lock. Deferring all teardown prevents releasing the engine from
             // inside that callback.
             DispatchQueue.main.async {
-                self?.engineConfigurationChanged(generation: generation)
+                self?.engineConfigurationChanged(generation: generation, epoch: epoch)
             }
         }
     }
@@ -446,8 +503,10 @@ final class MicRecorder: @unchecked Sendable {
         }
     }
 
-    private func engineConfigurationChanged(generation: Int) {
-        guard isRecording, generation == recoveryGeneration else { return }
+    private func engineConfigurationChanged(generation: Int, epoch: UInt64) {
+        guard isRecording,
+              generation == recoveryGeneration,
+              isCurrentEngine(epoch) else { return }
         guard recoveryState.health != .reconnecting else { return }
         beginRecovery(
             at: Self.date(from: lastBufferAtBits.load(ordering: .acquiring))
@@ -475,6 +534,7 @@ final class MicRecorder: @unchecked Sendable {
         acceptsTapWrites.store(false, ordering: .releasing)
         awaitingRecoveryBuffer.store(true, ordering: .releasing)
         tearDownEngine()
+        recoveryClaim.reset()
         scheduleRecoveryDeadline(generation: generation)
 
         DispatchQueue.main.async { [weak self] in
@@ -502,7 +562,8 @@ final class MicRecorder: @unchecked Sendable {
     private func failRecovery(generation: Int) {
         guard isRecording,
               recoveryGeneration == generation,
-              recoveryState.health == .reconnecting else { return }
+              recoveryState.health == .reconnecting,
+              recoveryClaim.claimTimeout() else { return }
         recoveryState.recoveryTimedOut()
         emitHealthChange(generation: generation)
         awaitingRecoveryBuffer.store(false, ordering: .releasing)
@@ -531,13 +592,23 @@ final class MicRecorder: @unchecked Sendable {
     }
 
     private func tearDownEngine() {
+        advanceEngineEpoch()
         acceptsTapWrites.store(false, ordering: .releasing)
         removeConfigurationObserver()
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
     }
 
-    private func recordFirstBufferIfNeeded(at bits: UInt64) {
+    private func advanceEngineEpoch() {
+        currentEngineEpoch &+= 1
+        engineEpochBits.store(currentEngineEpoch, ordering: .releasing)
+    }
+
+    private func isCurrentEngine(_ epoch: UInt64) -> Bool {
+        engineEpochBits.load(ordering: .acquiring) == epoch
+    }
+
+    private func recordFirstBufferIfNeeded(at bits: UInt64, epoch: UInt64) {
         guard firstBufferAtBits.compareExchange(
             expected: 0,
             desired: bits,
@@ -547,29 +618,45 @@ final class MicRecorder: @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   self.isRecording,
+                  self.isCurrentEngine(epoch),
                   self.generationBits.load(ordering: .acquiring) == generation,
                   self.firstBufferAt == nil else { return }
             self.firstBufferAt = Self.date(from: bits)
         }
     }
 
-    private func recordRecoveryBufferIfNeeded(at bits: UInt64) {
-        guard awaitingRecoveryBuffer.compareExchange(
-            expected: true,
-            desired: false,
-            ordering: .acquiringAndReleasing
-        ).exchanged else { return }
-        let generation = generationBits.load(ordering: .acquiring)
+    private func claimRecoveryBufferIfNeeded(at bits: UInt64, epoch: UInt64) -> Bool {
+        guard isCurrentEngine(epoch),
+              acceptsTapWrites.load(ordering: .acquiring),
+              recoveryClaim.claimBuffer() else { return false }
+        return true
+    }
+
+    private func finishRecoveryAfterBuffer(at bits: UInt64, epoch: UInt64) {
         DispatchQueue.main.async { [weak self] in
             guard let self,
                   self.isRecording,
-                  self.generationBits.load(ordering: .acquiring) == generation,
+                  self.isCurrentEngine(epoch),
                   self.recoveryState.health == .reconnecting else { return }
             guard let capturedAt = Self.date(from: bits) else { return }
             self.recoveryState.captureResumed(at: capturedAt)
             self.recoveryDeadline = nil
             self.recoveryGapStartedAt = nil
             self.emitHealthChange()
+        }
+    }
+
+    private func failClaimedRecovery(epoch: UInt64) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.isRecording,
+                  self.isCurrentEngine(epoch),
+                  self.recoveryState.health == .reconnecting else { return }
+            self.recoveryState.recoveryTimedOut()
+            self.emitHealthChange()
+            self.awaitingRecoveryBuffer.store(false, ordering: .releasing)
+            self.acceptsTapWrites.store(false, ordering: .releasing)
+            self.tearDownEngine()
         }
     }
 
@@ -599,8 +686,7 @@ final class MicRecorder: @unchecked Sendable {
     }
 
     static func inputRouteChanged(from active: InputDescription?, to current: InputDescription?) -> Bool {
-        guard let active, let current else { return false }
-        return active != current
+        active != current
     }
 
     private static func date(from bits: UInt64) -> Date? {
@@ -636,7 +722,7 @@ final class MicRecorder: @unchecked Sendable {
             guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else {
                 return nil
             }
-            return value?.takeUnretainedValue() as String?
+            return value?.takeRetainedValue() as String?
         }
 
         guard let name = stringProperty(kAudioObjectPropertyName),
@@ -657,26 +743,45 @@ final class MicRecorder: @unchecked Sendable {
             &nominalSampleRate
         ) == noErr else { return nil }
 
-        var streamFormat = AudioStreamBasicDescription()
-        var streamFormatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        var streamFormatAddress = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamFormat,
+        var streamConfigurationAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
             mScope: kAudioObjectPropertyScopeInput,
             mElement: kAudioObjectPropertyElementMain
         )
-        guard AudioObjectGetPropertyData(
+        var streamConfigurationSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(
             deviceID,
-            &streamFormatAddress,
+            &streamConfigurationAddress,
             0,
             nil,
-            &streamFormatSize,
-            &streamFormat
+            &streamConfigurationSize
+        ) == noErr,
+        streamConfigurationSize >= MemoryLayout<AudioBufferList>.size else { return nil }
+        let streamConfiguration = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(streamConfigurationSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { streamConfiguration.deallocate() }
+        guard AudioObjectGetPropertyData(
+            deviceID,
+            &streamConfigurationAddress,
+            0,
+            nil,
+            &streamConfigurationSize,
+            streamConfiguration
         ) == noErr else { return nil }
+        let bufferList = streamConfiguration.assumingMemoryBound(to: AudioBufferList.self)
+        let buffers = streamConfiguration
+            .advanced(by: MemoryLayout<AudioBufferList>.offset(of: \.mBuffers)!)
+            .assumingMemoryBound(to: AudioBuffer.self)
+        let channelCount = (0..<Int(bufferList.pointee.mNumberBuffers)).reduce(UInt32(0)) {
+            $0 + buffers.advanced(by: $1).pointee.mNumberChannels
+        }
         return InputDescription(
             name: name,
             uid: uid,
             sampleRate: nominalSampleRate,
-            channelCount: streamFormat.mChannelsPerFrame
+            channelCount: channelCount
         )
     }
 
@@ -684,11 +789,16 @@ final class MicRecorder: @unchecked Sendable {
         _ input: AVAudioPCMBuffer,
         with converter: AVAudioConverter,
         into output: AVAudioPCMBuffer,
-        to file: AVAudioFile
+        to file: AVAudioFile,
+        epoch: UInt64
     ) throws {
         let status = try Self.convert(input, with: converter, to: output)
         guard status == .haveData || status == .inputRanDry else { return }
         guard output.frameLength > 0 else { return }
+        guard isCurrentEngine(epoch),
+              acceptsTapWrites.load(ordering: .acquiring) else {
+            throw RecorderError.staleEngine
+        }
         try file.write(from: output)
     }
 
@@ -737,7 +847,19 @@ final class MicRecorder: @unchecked Sendable {
     /// Chunks are capped at one second so a long disconnection never requires
     /// a large temporary PCM allocation. Repeated recovery attempts resume at
     /// `silenceWrittenThrough` instead of writing the same gap twice.
-    private func writeSilence(for gap: DateInterval) throws {
+    private func writeRecoveryResidualSilence(through bits: UInt64, epoch: UInt64) throws {
+        guard let capturedAt = Self.date(from: bits) else { throw RecorderError.staleEngine }
+        guard isCurrentEngine(epoch),
+              acceptsTapWrites.load(ordering: .acquiring) else {
+            throw RecorderError.staleEngine
+        }
+        try writeSilence(for: DateInterval(
+            start: silenceWrittenThrough ?? capturedAt,
+            end: capturedAt
+        ), epoch: epoch)
+    }
+
+    private func writeSilence(for gap: DateInterval, epoch: UInt64? = nil) throws {
         guard let file else { return }
         let format = file.processingFormat
         guard format.sampleRate > 0 else { return }
@@ -760,6 +882,12 @@ final class MicRecorder: @unchecked Sendable {
             buffer.frameLength = frames
             for channel in 0..<Int(format.channelCount) {
                 buffer.floatChannelData?[channel].update(repeating: 0, count: Int(frames))
+            }
+            if let epoch {
+                guard isCurrentEngine(epoch),
+                      acceptsTapWrites.load(ordering: .acquiring) else {
+                    throw RecorderError.staleEngine
+                }
             }
             try file.write(from: buffer)
             remaining -= frames
