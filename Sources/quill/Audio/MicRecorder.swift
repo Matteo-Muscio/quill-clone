@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import Foundation
+import Synchronization
 
 enum MicCaptureHealth: String, Codable, Equatable, Sendable {
     case healthy
@@ -78,7 +79,7 @@ final class MicRecorder: @unchecked Sendable {
     private var url: URL?
     private var silenceWrittenThrough: Date?
     private var hasCapturedUsefulAudio = false
-    private var acceptsTapWrites = false
+    private let acceptsTapWrites = Atomic<Bool>(false)
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -109,7 +110,7 @@ final class MicRecorder: @unchecked Sendable {
     /// Stop capturing and finalize the file. Idempotent.
     func stop() {
         guard isRecording else { return }
-        acceptsTapWrites = false
+        acceptsTapWrites.store(false, ordering: .releasing)
         isRecording = false
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
@@ -160,7 +161,7 @@ final class MicRecorder: @unchecked Sendable {
         let input = engine.inputNode
         guard let outputFormat = file?.processingFormat else { return }
 
-        acceptsTapWrites = false
+        acceptsTapWrites.store(false, ordering: .releasing)
         var voice = voiceProcessing
         if voice {
             do {
@@ -224,7 +225,7 @@ final class MicRecorder: @unchecked Sendable {
             input.removeTap(onBus: 0)
             throw error
         }
-        acceptsTapWrites = true
+        acceptsTapWrites.store(true, ordering: .releasing)
 
         let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
             + "input=\(input.outputFormat(forBus: 0)) tap=\(monoFormat) output=\(outputFormat)\n"
@@ -256,7 +257,9 @@ final class MicRecorder: @unchecked Sendable {
         }
         let checkFrames = Int(tapFormat.sampleRate)
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: tapFormat) { [weak self] buffer, _ in
-            guard let self, self.acceptsTapWrites, let file = self.file else { return }
+            guard let self,
+                  self.acceptsTapWrites.load(ordering: .acquiring),
+                  let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
 
             if !self.livenessSettled {
@@ -308,7 +311,9 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.formatUnsupported(outputFormat)
         }
         input.installTap(onBus: 0, bufferSize: tapBufferSize, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, self.acceptsTapWrites, let file = self.file else { return }
+            guard let self,
+                  self.acceptsTapWrites.load(ordering: .acquiring),
+                  let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
             do {
                 try self.write(buffer, with: converter, into: output, to: file)
@@ -417,7 +422,7 @@ final class MicRecorder: @unchecked Sendable {
         FileHandle.standardError.write(Data(
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))
-        acceptsTapWrites = false
+        acceptsTapWrites.store(false, ordering: .releasing)
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         let recreateFile = !hasCapturedUsefulAudio
