@@ -25,7 +25,10 @@ struct MicRecoveryState: Equatable, Sendable {
         health = .reconnecting
     }
 
-    mutating func recoveryTimedOut() { health = .failed }
+    mutating func recoveryTimedOut() {
+        guard health == .reconnecting, interruptions.last?.endedAt == nil else { return }
+        health = .failed
+    }
     mutating func retryRecovery() { health = .reconnecting }
 
     mutating func captureResumed(at date: Date) {

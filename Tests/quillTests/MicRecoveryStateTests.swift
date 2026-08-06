@@ -26,6 +26,15 @@ final class MicRecoveryStateTests: XCTestCase {
         XCTAssertNil(state.interruptions.last?.endedAt)
     }
 
+    func testStaleTimeoutAfterCaptureResumesLeavesHealthHealthy() {
+        var state = MicRecoveryState()
+        state.captureLost(at: start)
+        state.captureResumed(at: start.addingTimeInterval(2.5))
+        state.recoveryTimedOut()
+
+        XCTAssertEqual(state.health, .healthy)
+    }
+
     func testRouteChangeRetriesWithoutOpeningASecondGap() {
         var state = MicRecoveryState()
         state.captureLost(at: start)
