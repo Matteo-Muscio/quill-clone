@@ -11,6 +11,10 @@ final class RecordingSession {
     private let mic = MicRecorder()
     private let system = SystemAudioRecorder()
 
+    var onMicHealthChange: (@MainActor @Sendable (MicCaptureHealth) -> Void)? {
+        didSet { mic.onHealthChange = onMicHealthChange }
+    }
+
     private static let folderFormat: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy.MM.dd-HHmm"
@@ -50,29 +54,65 @@ final class RecordingSession {
         system.stop()
 
         let ended = Date()
-        let iso = ISO8601DateFormatter()
-
-        // The tracks don't start on the same buffer; record how far each
-        // lags the earliest so transcript timestamps share one clock.
-        let micStart = mic.firstBufferAt ?? startedAt
-        let systemStart = system.firstBufferAt ?? startedAt
-        let earliest = min(micStart, systemStart)
-
-        let meta: [String: Any] = [
-            "started": iso.string(from: startedAt),
-            "ended": iso.string(from: ended),
-            "duration_seconds": Int(ended.timeIntervalSince(startedAt)),
-            "files": ["mic": "mic.caf", "system": "system.caf"],
-            "start_offset_ms": [
-                "mic": Int(micStart.timeIntervalSince(earliest) * 1000),
-                "system": Int(systemStart.timeIntervalSince(earliest) * 1000),
-            ],
-        ]
+        let meta = Self.makeMetadata(
+            startedAt: startedAt,
+            endedAt: ended,
+            micFirstBufferAt: mic.firstBufferAt,
+            systemFirstBufferAt: system.firstBufferAt,
+            recoveryState: mic.recoveryState,
+            initialInput: mic.initialInput
+        )
         if let data = try? JSONSerialization.data(
             withJSONObject: meta,
             options: [.prettyPrinted, .sortedKeys]
         ) {
             try? data.write(to: dir.appendingPathComponent("meta.json"))
         }
+    }
+
+    static func makeMetadata(
+        startedAt: Date,
+        endedAt: Date,
+        micFirstBufferAt: Date?,
+        systemFirstBufferAt: Date?,
+        recoveryState: MicRecoveryState,
+        initialInput: InputDescription?
+    ) -> [String: Any] {
+        let iso = ISO8601DateFormatter()
+        let micStart = micFirstBufferAt ?? startedAt
+        let systemStart = systemFirstBufferAt ?? startedAt
+        let earliest = min(micStart, systemStart)
+        let finalStatus: MicCaptureHealth = micFirstBufferAt == nil ? .failed : recoveryState.health
+
+        var microphone: [String: Any] = [
+            "partial": micFirstBufferAt == nil || finalStatus == .failed,
+            "final_status": finalStatus.rawValue,
+            "interruptions": recoveryState.interruptions.map { interruption in
+                [
+                    "started": iso.string(from: interruption.startedAt),
+                    "ended": iso.string(from: interruption.endedAt ?? endedAt),
+                ]
+            },
+        ]
+        if let initialInput {
+            microphone["initial_device"] = [
+                "name": initialInput.name,
+                "uid": initialInput.uid,
+                "sample_rate": initialInput.sampleRate,
+                "channels": initialInput.channelCount,
+            ]
+        }
+
+        return [
+            "started": iso.string(from: startedAt),
+            "ended": iso.string(from: endedAt),
+            "duration_seconds": Int(endedAt.timeIntervalSince(startedAt)),
+            "files": ["mic": "mic.caf", "system": "system.caf"],
+            "start_offset_ms": [
+                "mic": Int(micStart.timeIntervalSince(earliest) * 1000),
+                "system": Int(systemStart.timeIntervalSince(earliest) * 1000),
+            ],
+            "microphone": microphone,
+        ]
     }
 }
