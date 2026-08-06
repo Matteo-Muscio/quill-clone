@@ -9,8 +9,10 @@ final class MenuBarController {
     private let stateLabel: NSMenuItem
     private let transcriptionLabel: NSMenuItem
     private let toggleItem: NSMenuItem
+    private let openSoundSettingsItem: NSMenuItem
 
     var onToggle: (() -> Void)?
+    var onOpenSoundSettings: (() -> Void)?
     var onOpenSettings: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
@@ -39,6 +41,14 @@ final class MenuBarController {
         )
         menu.addItem(toggleItem)
 
+        openSoundSettingsItem = NSMenuItem(
+            title: "Open Sound Settings…",
+            action: #selector(openSoundSettingsClicked),
+            keyEquivalent: ""
+        )
+        openSoundSettingsItem.isHidden = true
+        menu.addItem(openSoundSettingsItem)
+
         let openFolder = NSMenuItem(
             title: "Open recordings folder",
             action: #selector(openFolderClicked),
@@ -64,7 +74,7 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openFolder, settings, quit] {
+        for item in [toggleItem, openSoundSettingsItem, openFolder, settings, quit] {
             item.target = self
         }
 
@@ -84,16 +94,35 @@ final class MenuBarController {
     /// menu bar shows only the template icon; the elapsed
     /// counter lives in the menu's state label. Call once a second while
     /// recording.
-    func update(recording: Bool, elapsed: String?) {
-        stateLabel.title = recording ? "● recording · \(elapsed ?? "0:00")" : "idle"
-        toggleItem.title = recording ? "Stop recording" : "Start recording"
-        let image = recording ? Self.recordingImage() : Self.featherImage()
+    func update(indicator: RecordingIndicator, elapsed: String?) {
+        switch indicator {
+        case .idle:
+            stateLabel.title = "idle"
+        case .recording:
+            stateLabel.title = "● recording · \(elapsed ?? "0:00")"
+        case .microphoneFailed:
+            stateLabel.title = "Microphone unavailable - system audio still recording"
+        }
+        toggleItem.title = indicator == .idle ? "Start recording" : "Stop recording"
+        openSoundSettingsItem.isHidden = indicator != .microphoneFailed
+        let image: NSImage?
+        switch indicator {
+        case .idle:
+            image = Self.featherImage()
+        case .recording:
+            image = Self.recordingImage()
+        case .microphoneFailed:
+            image = Self.microphoneFailedImage()
+        }
         image?.isTemplate = true
         statusItem.button?.image = image
         statusItem.button?.setAccessibilityLabel("Quill")
-        statusItem.button?.setAccessibilityValue(
-            recording ? "Recording, \(elapsed ?? "0:00")" : "Idle"
-        )
+        let accessibilityValue = switch indicator {
+        case .idle: "Idle"
+        case .recording: "Recording, \(elapsed ?? "0:00")"
+        case .microphoneFailed: "Microphone unavailable - system audio still recording"
+        }
+        statusItem.button?.setAccessibilityValue(accessibilityValue)
     }
 
     /// Prevent a new recording while model download or verification is active.
@@ -142,7 +171,15 @@ final class MenuBarController {
         )
     }
 
+    private static func microphoneFailedImage() -> NSImage? {
+        NSImage(
+            systemSymbolName: "exclamationmark.triangle.fill",
+            accessibilityDescription: "Microphone unavailable"
+        )
+    }
+
     @objc private func toggleClicked() { onToggle?() }
+    @objc private func openSoundSettingsClicked() { onOpenSoundSettings?() }
     @objc private func openSettingsClicked() { onOpenSettings?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
     @objc private func quitClicked() { onQuit?() }

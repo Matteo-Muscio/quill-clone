@@ -75,10 +75,22 @@ struct Doctor: ParsableCommand {
     }
 }
 
+enum RecordingIndicator: Equatable {
+    case idle
+    case recording
+    case microphoneFailed
+}
+
 struct AppBusyState {
     var isRecording = false
     var isTranscribing = false
     var isPreparingModel = false
+    var micHealth: MicCaptureHealth = .healthy
+
+    var recordingIndicator: RecordingIndicator {
+        guard isRecording else { return .idle }
+        return micHealth == .failed ? .microphoneFailed : .recording
+    }
 
     var modelActionsLocked: Bool {
         isRecording || isTranscribing
@@ -106,6 +118,7 @@ final class AppController {
     private var session: RecordingSession?
     private var ticker: Timer?
     private var busyState = AppBusyState()
+    private var hasNotifiedMicrophoneFailure = false
     private var cancellables: Set<AnyCancellable> = []
     private var statusTask: Task<Void, Never>?
 
@@ -132,7 +145,8 @@ final class AppController {
         menuBar.onOpenSettings = { [weak self] in self?.settingsWindow.show() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
-        menuBar.update(recording: false, elapsed: nil)
+        menuBar.onOpenSoundSettings = { [weak self] in self?.openSoundSettings() }
+        menuBar.update(indicator: .idle, elapsed: nil)
 
         modelManager.$isPreparingModel
             .sink { [weak self] (isPreparing: Bool) in
@@ -169,7 +183,12 @@ final class AppController {
     private func startSession() {
         guard busyState.canStartRecording else { return }
         do {
+            busyState.micHealth = .healthy
+            hasNotifiedMicrophoneFailure = false
             let newSession = try RecordingSession(root: root)
+            newSession.onMicHealthChange = { [weak self] health in
+                self?.handleMicHealthChange(health)
+            }
             try newSession.start()
             session = newSession
             busyState.isRecording = true
@@ -181,7 +200,7 @@ final class AppController {
             return
         }
 
-        menuBar.update(recording: true, elapsed: "0:00")
+        menuBar.update(indicator: busyState.recordingIndicator, elapsed: "0:00")
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
@@ -195,13 +214,15 @@ final class AppController {
             "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
         ))
         self.session = nil
+        busyState.micHealth = .healthy
+        hasNotifiedMicrophoneFailure = false
         busyState.finishRecording(
             transcriptionEnabled: Config.transcriptionEnabled()
         )
         syncBusyState()
         ticker?.invalidate()
         ticker = nil
-        menuBar.update(recording: false, elapsed: nil)
+        menuBar.update(indicator: busyState.recordingIndicator, elapsed: nil)
 
         let dir = session.dir
         Task { [transcription] in await transcription.enqueue(dir) }
@@ -246,9 +267,35 @@ final class AppController {
     private func tick() {
         guard let session else { return }
         menuBar.update(
-            recording: true,
+            indicator: busyState.recordingIndicator,
             elapsed: Self.format(Date().timeIntervalSince(session.startedAt))
         )
+    }
+
+    private func handleMicHealthChange(_ health: MicCaptureHealth) {
+        let wasFailed = busyState.micHealth == .failed
+        busyState.micHealth = health
+        menuBar.update(
+            indicator: busyState.recordingIndicator,
+            elapsed: session.map { Self.format(Date().timeIntervalSince($0.startedAt)) }
+        )
+        if health == .failed && !wasFailed && !hasNotifiedMicrophoneFailure {
+            hasNotifiedMicrophoneFailure = true
+            notifyUser(
+                title: "quill - microphone unavailable",
+                body: "System audio is still recording. Choose a microphone in Sound Settings."
+            )
+        }
+    }
+
+    private func openSoundSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.Sound-Settings.extension") else {
+            FileHandle.standardError.write(Data("sound settings URL is invalid\n".utf8))
+            return
+        }
+        if !NSWorkspace.shared.open(url) {
+            FileHandle.standardError.write(Data("failed to open Sound Settings\n".utf8))
+        }
     }
 
     private func openFolder() {

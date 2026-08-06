@@ -51,4 +51,23 @@ final class AppControllerStateTests: XCTestCase {
         XCTAssertFalse(state.isTranscribing)
         XCTAssertFalse(state.modelActionsLocked)
     }
+
+    func testRecordingWithFailedMicrophoneShowsFailureIndicatorWithoutEndingRecording() {
+        var state = AppBusyState()
+        state.isRecording = true
+        state.micHealth = .failed
+
+        XCTAssertTrue(state.isRecording)
+        XCTAssertEqual(state.recordingIndicator, .microphoneFailed)
+    }
+
+    func testHealthyMicrophoneRecoveryRestoresRecordingIndicator() {
+        var state = AppBusyState()
+        state.isRecording = true
+        state.micHealth = .failed
+
+        state.micHealth = .healthy
+
+        XCTAssertEqual(state.recordingIndicator, .recording)
+    }
 }
