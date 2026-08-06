@@ -109,6 +109,23 @@ final class MicRecoveryStateTests: XCTestCase {
         XCTAssertFalse(claim.claimTimeout())
     }
 
+    func testNonzeroVoiceWritePreservesFileAfterLivenessResets() {
+        var hasCapturedUsefulAudio = false
+
+        if MicRecorder.voiceBufferContainsUsefulAudio(peak: 0.25) {
+            hasCapturedUsefulAudio = true
+        }
+        // A route change resets the next attachment's liveness window, but
+        // must not make already-written voice audio disposable.
+
+        XCTAssertFalse(MicRecorder.shouldRecreateFileForRawFallback(
+            hasCapturedUsefulAudio: hasCapturedUsefulAudio
+        ))
+        XCTAssertTrue(MicRecorder.shouldRecreateFileForRawFallback(
+            hasCapturedUsefulAudio: false
+        ))
+    }
+
     func testTimeoutClaimPreventsRecoveredBufferClaim() {
         let claim = RecoveryClaim()
 

@@ -349,22 +349,17 @@ final class MicRecorder: @unchecked Sendable {
                   let file = self.file else { return }
             let capturedAtBits = Self.currentDateBits()
             self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
+            let voiceBufferPeak = Self.peak(of: buffer)
 
             if !self.livenessSettled {
-                let frames = Int(buffer.frameLength)
-                if let data = buffer.floatChannelData?[0] {
-                    for i in 0..<frames {
-                        self.livenessPeak = max(self.livenessPeak, abs(data[i]))
-                    }
-                }
-                self.livenessFrames += frames
+                self.livenessPeak = max(self.livenessPeak, voiceBufferPeak)
+                self.livenessFrames += Int(buffer.frameLength)
                 if self.livenessFrames >= checkFrames {
                     self.livenessSettled = true
                     if self.livenessPeak == 0 {
                         DispatchQueue.main.async { self.fallBackToRaw() }
                         return
                     }
-                    self.hasCapturedUsefulAudio.store(true, ordering: .releasing)
                 }
             }
 
@@ -374,6 +369,9 @@ final class MicRecorder: @unchecked Sendable {
                     try self.writeRecoveryResidualSilence(through: capturedAtBits, epoch: tapEpoch)
                 }
                 try self.write(buffer, with: converter, into: output, to: file, epoch: tapEpoch)
+                if Self.voiceBufferContainsUsefulAudio(peak: voiceBufferPeak) {
+                    self.hasCapturedUsefulAudio.store(true, ordering: .releasing)
+                }
                 self.recordTrackStartIfNeeded(at: capturedAtBits)
                 if recovered {
                     self.finishRecoveryAfterBuffer(at: capturedAtBits, epoch: tapEpoch)
@@ -704,6 +702,23 @@ final class MicRecorder: @unchecked Sendable {
         initialSilenceAt ?? firstRealBufferAt
     }
 
+    static func voiceBufferContainsUsefulAudio(peak: Float) -> Bool {
+        peak > 0
+    }
+
+    static func shouldRecreateFileForRawFallback(hasCapturedUsefulAudio: Bool) -> Bool {
+        !hasCapturedUsefulAudio
+    }
+
+    private static func peak(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let data = buffer.floatChannelData?[0] else { return 0 }
+        var peak: Float = 0
+        for index in 0..<Int(buffer.frameLength) {
+            peak = max(peak, abs(data[index]))
+        }
+        return peak
+    }
+
     private static func date(from bits: UInt64) -> Date? {
         guard bits != 0 else { return nil }
         return Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits))
@@ -925,7 +940,9 @@ final class MicRecorder: @unchecked Sendable {
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))
         tearDownEngine()
-        let recreateFile = !hasCapturedUsefulAudio.load(ordering: .acquiring)
+        let recreateFile = Self.shouldRecreateFileForRawFallback(
+            hasCapturedUsefulAudio: hasCapturedUsefulAudio.load(ordering: .acquiring)
+        )
         if recreateFile {
             withFileAccessBarrier {
                 file = nil
