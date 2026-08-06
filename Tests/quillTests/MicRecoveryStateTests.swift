@@ -46,6 +46,46 @@ final class MicRecoveryStateTests: XCTestCase {
         XCTAssertEqual(state.interruptions.count, 1)
     }
 
+    func testFixedDatePolicyClosesTheOriginalInterruptionAfterFailedRetry() {
+        let lostAt = Date(timeIntervalSince1970: 1_000)
+        let resumedAt = Date(timeIntervalSince1970: 1_007)
+        var state = MicRecoveryState()
+
+        state.captureLost(at: lostAt)
+        state.recoveryTimedOut()
+        state.retryRecovery()
+        state.captureResumed(at: resumedAt)
+
+        XCTAssertEqual(state.health, .healthy)
+        XCTAssertEqual(state.interruptions, [
+            .init(startedAt: lostAt, endedAt: resumedAt),
+        ])
+    }
+
+    func testWatchdogTreatsMissingOrStaleBuffersAsCaptureLoss() {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+        let now = startedAt.addingTimeInterval(2.1)
+
+        XCTAssertTrue(MicRecorder.captureIsStale(
+            startedAt: startedAt,
+            lastBufferAt: nil,
+            now: now,
+            timeout: 2
+        ))
+        XCTAssertFalse(MicRecorder.captureIsStale(
+            startedAt: startedAt,
+            lastBufferAt: now.addingTimeInterval(-1),
+            now: now,
+            timeout: 2
+        ))
+        XCTAssertTrue(MicRecorder.captureIsStale(
+            startedAt: startedAt,
+            lastBufferAt: now.addingTimeInterval(-2.1),
+            now: now,
+            timeout: 2
+        ))
+    }
+
     func testFinishClosesAnOpenInterruption() {
         var state = MicRecoveryState()
         state.captureLost(at: start)

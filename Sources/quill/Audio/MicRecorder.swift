@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import CoreAudio
 import Foundation
 import Synchronization
 
@@ -48,6 +49,13 @@ struct MicRecoveryState: Equatable, Sendable {
     }
 }
 
+struct InputDescription: Equatable, Sendable {
+    let name: String
+    let uid: String
+    let sampleRate: Double
+    let channelCount: UInt32
+}
+
 /// Records the default input device to a file via AVAudioEngine, encoding AAC
 /// mono. Buffers stream straight to disk — nothing is held in memory, so
 /// session length is unbounded.
@@ -78,12 +86,27 @@ final class MicRecorder: @unchecked Sendable {
     private var file: AVAudioFile?
     private var url: URL?
     private var silenceWrittenThrough: Date?
-    private var hasCapturedUsefulAudio = false
+    private let hasCapturedUsefulAudio = Atomic<Bool>(false)
     private let acceptsTapWrites = Atomic<Bool>(false)
+    private let firstBufferAtBits = Atomic<UInt64>(0)
+    private let lastBufferAtBits = Atomic<UInt64>(0)
+    private let awaitingRecoveryBuffer = Atomic<Bool>(false)
+    private let generationBits = Atomic<UInt64>(0)
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
     private(set) var firstBufferAt: Date?
+    private(set) var recoveryState = MicRecoveryState()
+    private(set) var initialInput: InputDescription?
+    var onHealthChange: (@MainActor @Sendable (MicCaptureHealth) -> Void)?
+
+    private var activeInput: InputDescription?
+    private var recordingStartedAt: Date?
+    private var recoveryGapStartedAt: Date?
+    private var recoveryDeadline: Date?
+    private var recoveryGeneration = 0
+    private var configurationObserver: NSObjectProtocol?
+    private var watchdog: Timer?
 
     // Liveness check state (voice-processing path only). Written from the tap
     // callback, read on main when deciding to fall back.
@@ -96,12 +119,27 @@ final class MicRecorder: @unchecked Sendable {
     func start(writingTo url: URL) throws {
         guard !isRecording else { return }
         self.url = url
+        recoveryGeneration &+= 1
+        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
+        recoveryState = MicRecoveryState()
+        initialInput = nil
+        activeInput = nil
+        recordingStartedAt = Date()
+        recoveryGapStartedAt = nil
+        recoveryDeadline = nil
+        firstBufferAt = nil
+        firstBufferAtBits.store(0, ordering: .releasing)
+        lastBufferAtBits.store(0, ordering: .releasing)
+        hasCapturedUsefulAudio.store(false, ordering: .releasing)
+        awaitingRecoveryBuffer.store(false, ordering: .releasing)
         engine = AVAudioEngine()
         do {
             try createFile(for: engine.inputNode.outputFormat(forBus: 0))
             try attach(voiceProcessing: Config.micVoiceProcessing())
             isRecording = true
+            startWatchdog()
         } catch {
+            tearDownEngine()
             file = nil
             throw error
         }
@@ -110,13 +148,18 @@ final class MicRecorder: @unchecked Sendable {
     /// Stop capturing and finalize the file. Idempotent.
     func stop() {
         guard isRecording else { return }
-        acceptsTapWrites.store(false, ordering: .releasing)
         isRecording = false
-        engine.stop()
-        engine.inputNode.removeTap(onBus: 0)
+        recoveryGeneration &+= 1
+        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
+        watchdog?.invalidate()
+        watchdog = nil
+        acceptsTapWrites.store(false, ordering: .releasing)
+        recoveryState.finish(at: Date())
+        tearDownEngine()
         file = nil
         silenceWrittenThrough = nil
-        hasCapturedUsefulAudio = false
+        hasCapturedUsefulAudio.store(false, ordering: .releasing)
+        awaitingRecoveryBuffer.store(false, ordering: .releasing)
     }
 
     // MARK: -
@@ -179,6 +222,12 @@ final class MicRecorder: @unchecked Sendable {
             }
         }
         let inputFormat = input.outputFormat(forBus: 0)
+        let inputDescription = Self.defaultInputDescription(
+            sampleRate: inputFormat.sampleRate,
+            channelCount: inputFormat.channelCount
+        )
+        if initialInput == nil { initialInput = inputDescription }
+        activeInput = inputDescription
 
         // One explicit mono client format. With voice processing this is the
         // Voice I/O boundary format on both sides of the duplex unit — never
@@ -209,9 +258,11 @@ final class MicRecorder: @unchecked Sendable {
         }
 
         engine.prepare()
+        observeConfigurationChanges(for: engine)
         do {
             try engine.start()
         } catch {
+            removeConfigurationObserver()
             input.removeTap(onBus: 0)
             throw RecorderError.engineStartFailed(error)
         }
@@ -260,7 +311,10 @@ final class MicRecorder: @unchecked Sendable {
             guard let self,
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
-            if self.firstBufferAt == nil { self.firstBufferAt = Date() }
+            let capturedAtBits = Self.currentDateBits()
+            self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
+            self.recordFirstBufferIfNeeded(at: capturedAtBits)
+            self.recordRecoveryBufferIfNeeded(at: capturedAtBits)
 
             if !self.livenessSettled {
                 let frames = Int(buffer.frameLength)
@@ -276,7 +330,7 @@ final class MicRecorder: @unchecked Sendable {
                         DispatchQueue.main.async { self.fallBackToRaw() }
                         return
                     }
-                    self.hasCapturedUsefulAudio = true
+                    self.hasCapturedUsefulAudio.store(true, ordering: .releasing)
                 }
             }
 
@@ -314,14 +368,263 @@ final class MicRecorder: @unchecked Sendable {
             guard let self,
                   self.acceptsTapWrites.load(ordering: .acquiring),
                   let file = self.file else { return }
-            if self.firstBufferAt == nil { self.firstBufferAt = Date() }
+            let capturedAtBits = Self.currentDateBits()
+            self.lastBufferAtBits.store(capturedAtBits, ordering: .releasing)
+            self.recordFirstBufferIfNeeded(at: capturedAtBits)
+            self.recordRecoveryBufferIfNeeded(at: capturedAtBits)
             do {
                 try self.write(buffer, with: converter, into: output, to: file)
-                self.hasCapturedUsefulAudio = true
+                self.hasCapturedUsefulAudio.store(true, ordering: .releasing)
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
+    }
+
+    // MARK: - Route recovery
+
+    private func observeConfigurationChanges(for observedEngine: AVAudioEngine) {
+        removeConfigurationObserver()
+        let generation = recoveryGeneration
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: observedEngine,
+            queue: nil
+        ) { [weak self] _ in
+            // Apple can deliver this while the engine owns an internal graph
+            // lock. Deferring all teardown prevents releasing the engine from
+            // inside that callback.
+            DispatchQueue.main.async {
+                self?.engineConfigurationChanged(generation: generation)
+            }
+        }
+    }
+
+    private func removeConfigurationObserver() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+    }
+
+    private func startWatchdog() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRecording else { return }
+            self.watchdog?.invalidate()
+            let watchdog = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+                self?.watchdogFired()
+            }
+            RunLoop.main.add(watchdog, forMode: .common)
+            self.watchdog = watchdog
+        }
+    }
+
+    private func watchdogFired() {
+        guard isRecording else { return }
+        let now = Date()
+
+        if recoveryState.health == .failed {
+            if let currentInput = Self.defaultInputDescription(), currentInput != activeInput {
+                beginRecovery(at: recoveryGapStartedAt ?? now, retryingFailedRecovery: true)
+            }
+            return
+        }
+
+        if recoveryState.health == .reconnecting {
+            if let recoveryDeadline, now >= recoveryDeadline {
+                recoveryState.recoveryTimedOut()
+                emitHealthChange()
+                awaitingRecoveryBuffer.store(false, ordering: .releasing)
+                acceptsTapWrites.store(false, ordering: .releasing)
+                tearDownEngine()
+            }
+            return
+        }
+
+        let lastBuffer = lastBufferAtBits.load(ordering: .acquiring)
+        let lastBufferAt = Self.date(from: lastBuffer)
+        if !engine.isRunning || Self.captureIsStale(
+            startedAt: recordingStartedAt ?? now,
+            lastBufferAt: lastBufferAt,
+            now: now,
+            timeout: 2
+        ) {
+            beginRecovery(at: Self.date(from: lastBuffer) ?? recordingStartedAt ?? now)
+        }
+    }
+
+    private func engineConfigurationChanged(generation: Int) {
+        guard isRecording, generation == recoveryGeneration else { return }
+        guard recoveryState.health != .reconnecting else { return }
+        beginRecovery(
+            at: Self.date(from: lastBufferAtBits.load(ordering: .acquiring))
+                ?? recordingStartedAt
+                ?? Date(),
+            retryingFailedRecovery: recoveryState.health == .failed
+        )
+    }
+
+    private func beginRecovery(at gapStart: Date, retryingFailedRecovery: Bool = false) {
+        guard isRecording else { return }
+        if retryingFailedRecovery {
+            guard recoveryState.health == .failed else { return }
+            recoveryState.retryRecovery()
+        } else {
+            guard recoveryState.health == .healthy else { return }
+            recoveryState.captureLost(at: gapStart)
+        }
+        emitHealthChange()
+
+        recoveryGapStartedAt = recoveryGapStartedAt ?? gapStart
+        recoveryDeadline = Date().addingTimeInterval(3)
+        recoveryGeneration &+= 1
+        generationBits.store(UInt64(bitPattern: Int64(recoveryGeneration)), ordering: .releasing)
+        let generation = recoveryGeneration
+        acceptsTapWrites.store(false, ordering: .releasing)
+        awaitingRecoveryBuffer.store(true, ordering: .releasing)
+        tearDownEngine()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.attachRecovery(generation: generation)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(500)) { [weak self] in
+            guard let self,
+                  self.isRecording,
+                  self.recoveryGeneration == generation,
+                  self.recoveryState.health == .reconnecting,
+                  self.awaitingRecoveryBuffer.load(ordering: .acquiring) else { return }
+            self.acceptsTapWrites.store(false, ordering: .releasing)
+            self.tearDownEngine()
+            self.attachRecovery(generation: generation)
+        }
+    }
+
+    private func attachRecovery(generation: Int) {
+        guard isRecording,
+              recoveryGeneration == generation,
+              recoveryState.health == .reconnecting else { return }
+        engine = AVAudioEngine()
+        do {
+            let gap = DateInterval(start: recoveryGapStartedAt ?? Date(), end: Date())
+            try attach(
+                voiceProcessing: Config.micVoiceProcessing(),
+                writingRecoverySilenceFor: gap
+            )
+        } catch {
+            tearDownEngine()
+            FileHandle.standardError.write(Data("mic route recovery attempt failed: \(error)\n".utf8))
+        }
+    }
+
+    private func tearDownEngine() {
+        acceptsTapWrites.store(false, ordering: .releasing)
+        removeConfigurationObserver()
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+    }
+
+    private func recordFirstBufferIfNeeded(at bits: UInt64) {
+        guard firstBufferAtBits.compareExchange(
+            expected: 0,
+            desired: bits,
+            ordering: .acquiringAndReleasing
+        ).exchanged else { return }
+        let generation = generationBits.load(ordering: .acquiring)
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.isRecording,
+                  self.generationBits.load(ordering: .acquiring) == generation,
+                  self.firstBufferAt == nil else { return }
+            self.firstBufferAt = Self.date(from: bits)
+        }
+    }
+
+    private func recordRecoveryBufferIfNeeded(at bits: UInt64) {
+        guard awaitingRecoveryBuffer.compareExchange(
+            expected: true,
+            desired: false,
+            ordering: .acquiringAndReleasing
+        ).exchanged else { return }
+        let generation = generationBits.load(ordering: .acquiring)
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.isRecording,
+                  self.generationBits.load(ordering: .acquiring) == generation,
+                  self.recoveryState.health == .reconnecting else { return }
+            guard let capturedAt = Self.date(from: bits) else { return }
+            self.recoveryState.captureResumed(at: capturedAt)
+            self.recoveryDeadline = nil
+            self.recoveryGapStartedAt = nil
+            self.emitHealthChange()
+        }
+    }
+
+    private func emitHealthChange() {
+        let callback = onHealthChange
+        let health = recoveryState.health
+        Task { @MainActor in callback?(health) }
+    }
+
+    private static func currentDateBits() -> UInt64 {
+        Date().timeIntervalSinceReferenceDate.bitPattern
+    }
+
+    static func captureIsStale(
+        startedAt: Date,
+        lastBufferAt: Date?,
+        now: Date,
+        timeout: TimeInterval
+    ) -> Bool {
+        now.timeIntervalSince(lastBufferAt ?? startedAt) >= timeout
+    }
+
+    private static func date(from bits: UInt64) -> Date? {
+        guard bits != 0 else { return nil }
+        return Date(timeIntervalSinceReferenceDate: Double(bitPattern: bits))
+    }
+
+    private static func defaultInputDescription(
+        sampleRate: Double? = nil,
+        channelCount: UInt32? = nil
+    ) -> InputDescription? {
+        var deviceID = AudioObjectID(kAudioObjectUnknown)
+        var deviceSize = UInt32(MemoryLayout<AudioObjectID>.size)
+        var deviceAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceAddress,
+            0,
+            nil,
+            &deviceSize,
+            &deviceID
+        ) == noErr, deviceID != kAudioObjectUnknown else { return nil }
+
+        func stringProperty(_ selector: AudioObjectPropertySelector) -> String? {
+            var value: Unmanaged<CFString>?
+            var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &value) == noErr else {
+                return nil
+            }
+            return value?.takeUnretainedValue() as String?
+        }
+
+        guard let name = stringProperty(kAudioObjectPropertyName),
+              let uid = stringProperty(kAudioDevicePropertyDeviceUID) else { return nil }
+        return InputDescription(
+            name: name,
+            uid: uid,
+            sampleRate: sampleRate ?? 0,
+            channelCount: channelCount ?? 0
+        )
     }
 
     private func write(
@@ -422,13 +725,12 @@ final class MicRecorder: @unchecked Sendable {
         FileHandle.standardError.write(Data(
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))
-        acceptsTapWrites.store(false, ordering: .releasing)
-        engine.stop()
-        engine.inputNode.removeTap(onBus: 0)
-        let recreateFile = !hasCapturedUsefulAudio
+        tearDownEngine()
+        let recreateFile = !hasCapturedUsefulAudio.load(ordering: .acquiring)
         if recreateFile {
             file = nil
             firstBufferAt = nil
+            firstBufferAtBits.store(0, ordering: .releasing)
             silenceWrittenThrough = nil
             if let url {
                 try? FileManager.default.removeItem(at: url)
