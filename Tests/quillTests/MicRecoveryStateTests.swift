@@ -55,4 +55,22 @@ final class MicRecoveryStateTests: XCTestCase {
             start.addingTimeInterval(10)
         )
     }
+
+    func testConversionCapacityAccountsForUpsampling() {
+        XCTAssertEqual(
+            MicRecorder.convertedFrameCapacity(
+                inputFrames: 4_096,
+                inputRate: 24_000,
+                outputRate: 48_000
+            ),
+            8_192
+        )
+    }
+
+    func testSilenceFramesPreserveElapsedTime() {
+        XCTAssertEqual(
+            MicRecorder.silenceFrameCount(seconds: 2.5, sampleRate: 48_000),
+            120_000
+        )
+    }
 }

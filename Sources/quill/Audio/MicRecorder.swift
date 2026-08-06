@@ -76,6 +76,8 @@ final class MicRecorder: @unchecked Sendable {
     private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     private var url: URL?
+    private var silenceWrittenThrough: Date?
+    private var hasCapturedUsefulAudio = false
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -92,8 +94,15 @@ final class MicRecorder: @unchecked Sendable {
     func start(writingTo url: URL) throws {
         guard !isRecording else { return }
         self.url = url
-        try attach(voiceProcessing: Config.micVoiceProcessing())
-        isRecording = true
+        engine = AVAudioEngine()
+        do {
+            try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+            try attach(voiceProcessing: Config.micVoiceProcessing())
+            isRecording = true
+        } catch {
+            file = nil
+            throw error
+        }
     }
 
     /// Stop capturing and finalize the file. Idempotent.
@@ -103,18 +112,57 @@ final class MicRecorder: @unchecked Sendable {
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         file = nil
+        silenceWrittenThrough = nil
+        hasCapturedUsefulAudio = false
     }
 
     // MARK: -
 
-    /// Build the engine graph, create the AAC file, and start capture. Called
-    /// once at start, and a second time (voiceProcessing: false) if the
-    /// liveness check trips.
-    private func attach(voiceProcessing: Bool) throws {
-        engine = AVAudioEngine()
+    /// Creates the session's one stable output format. Later engine
+    /// attachments always convert their current route format into this file.
+    private func createFile(for inputFormat: AVAudioFormat) throws {
+        guard let url else { return }
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: inputFormat.sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            throw RecorderError.formatUnsupported(inputFormat)
+        }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: monoFormat.sampleRate,
+            AVNumberOfChannelsKey: 1,
+        ]
+        do {
+            file = try AVAudioFile(
+                forWriting: url,
+                settings: settings,
+                commonFormat: monoFormat.commonFormat,
+                interleaved: monoFormat.isInterleaved
+            )
+        } catch {
+            throw RecorderError.fileCreationFailed(error)
+        }
+    }
+
+    /// Build the engine graph and attach it to the already-open microphone
+    /// file. This is reusable after an input route changes without truncating
+    /// audio that has already been captured.
+    private func attach(
+        voiceProcessing: Bool,
+        writingRecoverySilenceFor gap: DateInterval? = nil
+    ) throws {
         let input = engine.inputNode
+        guard let outputFormat = file?.processingFormat else { return }
 
         var voice = voiceProcessing
+        if let gap {
+            try writeSilence(for: gap)
+        }
+
         if voice {
             do {
                 try input.setVoiceProcessingEnabled(true)
@@ -146,22 +194,6 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.formatUnsupported(inputFormat)
         }
 
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: monoFormat.sampleRate,
-            AVNumberOfChannelsKey: 1,
-        ]
-        do {
-            file = try AVAudioFile(
-                forWriting: url!,
-                settings: settings,
-                commonFormat: monoFormat.commonFormat,
-                interleaved: monoFormat.isInterleaved
-            )
-        } catch {
-            throw RecorderError.fileCreationFailed(error)
-        }
-
         if voice {
             // Complete the duplex graph: VoiceProcessingIO must render to an
             // output device or the input side never produces audio. The mixer
@@ -171,9 +203,9 @@ final class MicRecorder: @unchecked Sendable {
             livenessFrames = 0
             livenessPeak = 0
             livenessSettled = false
-            installVoiceTap(on: input, format: monoFormat)
+            try installVoiceTap(on: input, tapFormat: monoFormat, outputFormat: outputFormat)
         } else {
-            try installRawTap(on: input, inputFormat: inputFormat, monoFormat: monoFormat)
+            try installRawTap(on: input, inputFormat: inputFormat, outputFormat: outputFormat)
         }
 
         engine.prepare()
@@ -181,23 +213,27 @@ final class MicRecorder: @unchecked Sendable {
             try engine.start()
         } catch {
             input.removeTap(onBus: 0)
-            file = nil
             throw RecorderError.engineStartFailed(error)
         }
 
         let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
-            + "input=\(input.outputFormat(forBus: 0)) tap=\(monoFormat)\n"
+            + "input=\(input.outputFormat(forBus: 0)) tap=\(monoFormat) output=\(outputFormat)\n"
         FileHandle.standardError.write(Data(report.utf8))
     }
 
     /// Voice-processing path: the unit converts to the mono client format
-    /// itself, so tapped buffers write straight to the file. Tracks signal
-    /// peak over the first second — an unsupported route (device pair, macOS
-    /// AUVPAggregate defects) delivers callbacks full of digital zeros, and
-    /// the only recovery is restarting raw.
-    private func installVoiceTap(on input: AVAudioInputNode, format: AVAudioFormat) {
-        let checkFrames = Int(format.sampleRate)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+    /// itself. The resulting buffers still pass through a converter because
+    /// the stable file format may belong to a previous hardware route.
+    private func installVoiceTap(
+        on input: AVAudioInputNode,
+        tapFormat: AVAudioFormat,
+        outputFormat: AVAudioFormat
+    ) throws {
+        guard let converter = AVAudioConverter(from: tapFormat, to: outputFormat) else {
+            throw RecorderError.formatUnsupported(tapFormat)
+        }
+        let checkFrames = Int(tapFormat.sampleRate)
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
             guard let self, let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
 
@@ -215,41 +251,105 @@ final class MicRecorder: @unchecked Sendable {
                         DispatchQueue.main.async { self.fallBackToRaw() }
                         return
                     }
+                    self.hasCapturedUsefulAudio = true
                 }
             }
 
             do {
-                try file.write(from: buffer)
+                try self.write(buffer, with: converter, to: file, outputFormat: outputFormat)
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
     }
 
-    /// Raw path: tap at the device's native format and downmix to mono. Same
-    /// sample rate on both sides, so the one-shot convert applies.
+    /// Raw path: tap at the device's native format and convert it to the
+    /// stable file format, downmixing and resampling in the same operation.
     private func installRawTap(
         on input: AVAudioInputNode,
         inputFormat: AVAudioFormat,
-        monoFormat: AVAudioFormat
+        outputFormat: AVAudioFormat
     ) throws {
-        guard let converter = AVAudioConverter(from: inputFormat, to: monoFormat) else {
+        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
             throw RecorderError.formatUnsupported(inputFormat)
         }
         input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
             guard let self, let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
-            guard let mono = AVAudioPCMBuffer(
-                pcmFormat: monoFormat,
-                frameCapacity: buffer.frameCapacity
-            ) else { return }
             do {
-                try converter.convert(to: mono, from: buffer)
-                try file.write(from: mono)
+                try self.write(buffer, with: converter, to: file, outputFormat: outputFormat)
+                self.hasCapturedUsefulAudio = true
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
         }
+    }
+
+    private func write(
+        _ input: AVAudioPCMBuffer,
+        with converter: AVAudioConverter,
+        to file: AVAudioFile,
+        outputFormat: AVAudioFormat
+    ) throws {
+        let capacity = Self.convertedFrameCapacity(
+            inputFrames: input.frameLength,
+            inputRate: input.format.sampleRate,
+            outputRate: outputFormat.sampleRate
+        )
+        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
+            return
+        }
+        try converter.convert(to: output, from: input)
+        guard output.frameLength > 0 else { return }
+        try file.write(from: output)
+    }
+
+    static func convertedFrameCapacity(
+        inputFrames: AVAudioFrameCount,
+        inputRate: Double,
+        outputRate: Double
+    ) -> AVAudioFrameCount {
+        guard inputRate > 0, outputRate > 0 else { return 0 }
+        return AVAudioFrameCount(ceil(Double(inputFrames) * outputRate / inputRate))
+    }
+
+    static func silenceFrameCount(seconds: TimeInterval, sampleRate: Double) -> AVAudioFrameCount {
+        AVAudioFrameCount(max(0, (seconds * sampleRate).rounded()))
+    }
+
+    /// Materializes a recovered wall-clock gap into the stable file format.
+    /// Chunks are capped at one second so a long disconnection never requires
+    /// a large temporary PCM allocation. Repeated recovery attempts resume at
+    /// `silenceWrittenThrough` instead of writing the same gap twice.
+    private func writeSilence(for gap: DateInterval) throws {
+        guard let file else { return }
+        let format = file.processingFormat
+        guard format.sampleRate > 0 else { return }
+
+        let start = max(gap.start, silenceWrittenThrough ?? gap.start)
+        guard gap.end > start else { return }
+
+        var remaining = Self.silenceFrameCount(
+            seconds: gap.end.timeIntervalSince(start),
+            sampleRate: format.sampleRate
+        )
+        let maxChunkFrames = max(1, AVAudioFrameCount(format.sampleRate.rounded(.down)))
+        var writtenThrough = start
+
+        while remaining > 0 {
+            let frames = min(remaining, maxChunkFrames)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+            buffer.frameLength = frames
+            for channel in 0..<Int(format.channelCount) {
+                buffer.floatChannelData?[channel].update(repeating: 0, count: Int(frames))
+            }
+            try file.write(from: buffer)
+            remaining -= frames
+            writtenThrough = writtenThrough.addingTimeInterval(Double(frames) / format.sampleRate)
+            silenceWrittenThrough = writtenThrough
+        }
+
+        silenceWrittenThrough = gap.end
     }
 
     /// The voice-processing route delivered a full second of digital silence:
@@ -262,18 +362,26 @@ final class MicRecorder: @unchecked Sendable {
         ))
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
-        file = nil
-        firstBufferAt = nil
-        if let url {
-            try? FileManager.default.removeItem(at: url)
+        let recreateFile = !hasCapturedUsefulAudio
+        if recreateFile {
+            file = nil
+            firstBufferAt = nil
+            silenceWrittenThrough = nil
+            if let url {
+                try? FileManager.default.removeItem(at: url)
+            }
         }
+        engine = AVAudioEngine()
         do {
+            if recreateFile {
+                try createFile(for: engine.inputNode.outputFormat(forBus: 0))
+            }
             try attach(voiceProcessing: false)
         } catch {
             FileHandle.standardError.write(Data(
                 "mic raw fallback failed: \(error) — session continues without mic track\n".utf8
             ))
-            file = nil
+            if recreateFile { file = nil }
         }
     }
 }
