@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import Foundation
 
 enum MicCaptureHealth: String, Codable, Equatable, Sendable {
@@ -78,6 +78,7 @@ final class MicRecorder: @unchecked Sendable {
     private var url: URL?
     private var silenceWrittenThrough: Date?
     private var hasCapturedUsefulAudio = false
+    private var acceptsTapWrites = false
     private(set) var isRecording = false
     /// Wall-clock time of the first captured buffer — the track's true start,
     /// used to offset-align the two tracks' transcript timestamps.
@@ -108,6 +109,7 @@ final class MicRecorder: @unchecked Sendable {
     /// Stop capturing and finalize the file. Idempotent.
     func stop() {
         guard isRecording else { return }
+        acceptsTapWrites = false
         isRecording = false
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
@@ -158,11 +160,8 @@ final class MicRecorder: @unchecked Sendable {
         let input = engine.inputNode
         guard let outputFormat = file?.processingFormat else { return }
 
+        acceptsTapWrites = false
         var voice = voiceProcessing
-        if let gap {
-            try writeSilence(for: gap)
-        }
-
         if voice {
             do {
                 try input.setVoiceProcessingEnabled(true)
@@ -216,6 +215,17 @@ final class MicRecorder: @unchecked Sendable {
             throw RecorderError.engineStartFailed(error)
         }
 
+        do {
+            if let gap {
+                try writeSilence(for: gap)
+            }
+        } catch {
+            engine.stop()
+            input.removeTap(onBus: 0)
+            throw error
+        }
+        acceptsTapWrites = true
+
         let report = "mic: voiceProcessing=\(input.isVoiceProcessingEnabled) "
             + "input=\(input.outputFormat(forBus: 0)) tap=\(monoFormat) output=\(outputFormat)\n"
         FileHandle.standardError.write(Data(report.utf8))
@@ -232,9 +242,21 @@ final class MicRecorder: @unchecked Sendable {
         guard let converter = AVAudioConverter(from: tapFormat, to: outputFormat) else {
             throw RecorderError.formatUnsupported(tapFormat)
         }
+        let tapBufferSize: AVAudioFrameCount = 4_096
+        let outputCapacity = Self.convertedFrameCapacity(
+            inputFrames: tapBufferSize,
+            inputRate: tapFormat.sampleRate,
+            outputRate: outputFormat.sampleRate
+        )
+        guard let output = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: outputCapacity
+        ) else {
+            throw RecorderError.formatUnsupported(outputFormat)
+        }
         let checkFrames = Int(tapFormat.sampleRate)
-        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
-            guard let self, let file = self.file else { return }
+        input.installTap(onBus: 0, bufferSize: tapBufferSize, format: tapFormat) { [weak self] buffer, _ in
+            guard let self, self.acceptsTapWrites, let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
 
             if !self.livenessSettled {
@@ -256,7 +278,7 @@ final class MicRecorder: @unchecked Sendable {
             }
 
             do {
-                try self.write(buffer, with: converter, to: file, outputFormat: outputFormat)
+                try self.write(buffer, with: converter, into: output, to: file)
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
             }
@@ -273,11 +295,23 @@ final class MicRecorder: @unchecked Sendable {
         guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
             throw RecorderError.formatUnsupported(inputFormat)
         }
-        input.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            guard let self, let file = self.file else { return }
+        let tapBufferSize: AVAudioFrameCount = 4_096
+        let outputCapacity = Self.convertedFrameCapacity(
+            inputFrames: tapBufferSize,
+            inputRate: inputFormat.sampleRate,
+            outputRate: outputFormat.sampleRate
+        )
+        guard let output = AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: outputCapacity
+        ) else {
+            throw RecorderError.formatUnsupported(outputFormat)
+        }
+        input.installTap(onBus: 0, bufferSize: tapBufferSize, format: inputFormat) { [weak self] buffer, _ in
+            guard let self, self.acceptsTapWrites, let file = self.file else { return }
             if self.firstBufferAt == nil { self.firstBufferAt = Date() }
             do {
-                try self.write(buffer, with: converter, to: file, outputFormat: outputFormat)
+                try self.write(buffer, with: converter, into: output, to: file)
                 self.hasCapturedUsefulAudio = true
             } catch {
                 FileHandle.standardError.write(Data("mic track write failed: \(error)\n".utf8))
@@ -288,20 +322,41 @@ final class MicRecorder: @unchecked Sendable {
     private func write(
         _ input: AVAudioPCMBuffer,
         with converter: AVAudioConverter,
-        to file: AVAudioFile,
-        outputFormat: AVAudioFormat
+        into output: AVAudioPCMBuffer,
+        to file: AVAudioFile
     ) throws {
-        let capacity = Self.convertedFrameCapacity(
-            inputFrames: input.frameLength,
-            inputRate: input.format.sampleRate,
-            outputRate: outputFormat.sampleRate
-        )
-        guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: capacity) else {
-            return
-        }
-        try converter.convert(to: output, from: input)
+        let status = try Self.convert(input, with: converter, to: output)
+        guard status == .haveData || status == .inputRanDry else { return }
         guard output.frameLength > 0 else { return }
         try file.write(from: output)
+    }
+
+    static func convert(
+        _ input: AVAudioPCMBuffer,
+        with converter: AVAudioConverter,
+        to output: AVAudioPCMBuffer
+    ) throws -> AVAudioConverterOutputStatus {
+        output.frameLength = 0
+        if converter.primeMethod != .none {
+            converter.primeMethod = .none
+        }
+
+        // AVAudioConverter invokes this provider synchronously during convert.
+        nonisolated(unsafe) var suppliedInput = false
+        var conversionError: NSError?
+        let status = converter.convert(to: output, error: &conversionError) { _, inputStatus in
+            guard !suppliedInput else {
+                inputStatus.pointee = .noDataNow
+                return nil
+            }
+            suppliedInput = true
+            inputStatus.pointee = .haveData
+            return input
+        }
+        if let conversionError {
+            throw conversionError
+        }
+        return status
     }
 
     static func convertedFrameCapacity(
@@ -338,7 +393,9 @@ final class MicRecorder: @unchecked Sendable {
 
         while remaining > 0 {
             let frames = min(remaining, maxChunkFrames)
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
+                throw RecorderError.formatUnsupported(format)
+            }
             buffer.frameLength = frames
             for channel in 0..<Int(format.channelCount) {
                 buffer.floatChannelData?[channel].update(repeating: 0, count: Int(frames))
@@ -360,6 +417,7 @@ final class MicRecorder: @unchecked Sendable {
         FileHandle.standardError.write(Data(
             "warning: voice processing delivered silence — restarting mic raw\n".utf8
         ))
+        acceptsTapWrites = false
         engine.stop()
         engine.inputNode.removeTap(onBus: 0)
         let recreateFile = !hasCapturedUsefulAudio

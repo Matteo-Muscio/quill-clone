@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import quill
 
@@ -72,5 +73,71 @@ final class MicRecoveryStateTests: XCTestCase {
             MicRecorder.silenceFrameCount(seconds: 2.5, sampleRate: 48_000),
             120_000
         )
+    }
+
+    func testConverterUpsamplesAnEntireInputBuffer() throws {
+        let inputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 24_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let outputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let input = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4_096))
+        input.frameLength = 4_096
+        input.floatChannelData?[0].update(repeating: 0.25, count: 4_096)
+        let output = try XCTUnwrap(AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: MicRecorder.convertedFrameCapacity(
+                inputFrames: input.frameLength,
+                inputRate: inputFormat.sampleRate,
+                outputRate: outputFormat.sampleRate
+            )
+        ))
+        let converter = try XCTUnwrap(AVAudioConverter(from: inputFormat, to: outputFormat))
+
+        let status = try MicRecorder.convert(input, with: converter, to: output)
+
+        XCTAssertEqual(status, .haveData)
+        XCTAssertEqual(output.frameLength, 8_192)
+    }
+
+    func testConverterPreservesFractionalFramesWhenReused() throws {
+        let inputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 44_100,
+            channels: 1,
+            interleaved: false
+        ))
+        let outputFormat = try XCTUnwrap(AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: false
+        ))
+        let input = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4_096))
+        input.frameLength = 4_096
+        let output = try XCTUnwrap(AVAudioPCMBuffer(
+            pcmFormat: outputFormat,
+            frameCapacity: MicRecorder.convertedFrameCapacity(
+                inputFrames: input.frameLength,
+                inputRate: inputFormat.sampleRate,
+                outputRate: outputFormat.sampleRate
+            )
+        ))
+        let converter = try XCTUnwrap(AVAudioConverter(from: inputFormat, to: outputFormat))
+
+        var convertedFrames = 0
+        for _ in 0..<10 {
+            _ = try MicRecorder.convert(input, with: converter, to: output)
+            convertedFrames += Int(output.frameLength)
+        }
+
+        XCTAssertEqual(convertedFrames, 44_582)
     }
 }
