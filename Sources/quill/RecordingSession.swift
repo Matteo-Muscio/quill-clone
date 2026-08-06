@@ -82,7 +82,9 @@ final class RecordingSession {
         let micStart = micFirstBufferAt ?? startedAt
         let systemStart = systemFirstBufferAt ?? startedAt
         let earliest = min(micStart, systemStart)
-        let finalStatus: MicCaptureHealth = micFirstBufferAt == nil ? .failed : recoveryState.health
+        let finalStatus: MicCaptureHealth = micFirstBufferAt == nil || recoveryState.health != .healthy
+            ? .failed
+            : .healthy
 
         var microphone: [String: Any] = [
             "partial": micFirstBufferAt == nil || finalStatus == .failed,

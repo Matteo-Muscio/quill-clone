@@ -54,6 +54,24 @@ final class RecordingSessionMetadataTests: XCTestCase {
         XCTAssertNil(microphone["initial_device"])
     }
 
+    func testReconnectingMicrophoneAtFinalizationIsPartialAndFailed() {
+        var recoveryState = MicRecoveryState()
+        recoveryState.captureLost(at: startedAt.addingTimeInterval(2))
+
+        let metadata = RecordingSession.makeMetadata(
+            startedAt: startedAt,
+            endedAt: endedAt,
+            micFirstBufferAt: startedAt,
+            systemFirstBufferAt: startedAt,
+            recoveryState: recoveryState,
+            initialInput: nil
+        )
+
+        let microphone = try! XCTUnwrap(metadata["microphone"] as? [String: Any])
+        XCTAssertEqual(microphone["partial"] as? Bool, true)
+        XCTAssertEqual(microphone["final_status"] as? String, "failed")
+    }
+
     func testInterruptionMetadataUsesISO8601Dates() {
         let interruptionStartedAt = startedAt.addingTimeInterval(2)
         let interruptionEndedAt = startedAt.addingTimeInterval(4)
