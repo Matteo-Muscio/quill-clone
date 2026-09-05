@@ -7,6 +7,8 @@ import Foundation
 final class RecordingSession {
     let dir: URL
     let startedAt = Date()
+    private(set) var endedAt: Date?
+    private var finalizedMetadata: Data?
 
     private let mic = MicRecorder()
     private let system = SystemAudioRecorder()
@@ -48,26 +50,31 @@ final class RecordingSession {
         }
     }
 
-    /// Stop both tracks and write meta.json.
-    func stop() {
-        mic.stop()
-        system.stop()
-
-        let ended = Date()
-        let meta = Self.makeMetadata(
-            startedAt: startedAt,
-            endedAt: ended,
-            micFirstBufferAt: mic.firstBufferAt,
-            systemFirstBufferAt: system.firstBufferAt,
-            recoveryState: mic.recoveryState,
-            initialInput: mic.initialInput
-        )
-        if let data = try? JSONSerialization.data(
-            withJSONObject: meta,
-            options: [.prettyPrinted, .sortedKeys]
-        ) {
-            try? data.write(to: dir.appendingPathComponent("meta.json"))
+    /// Stop capture once, then save atomically. A failed save can be retried
+    /// without changing the recording's end time or losing its capture metadata.
+    func stop() throws {
+        if endedAt == nil {
+            mic.stop()
+            system.stop()
+            endedAt = Date()
         }
+        if finalizedMetadata == nil {
+            let meta = Self.makeMetadata(
+                startedAt: startedAt,
+                endedAt: endedAt!,
+                micFirstBufferAt: mic.firstBufferAt,
+                systemFirstBufferAt: system.firstBufferAt,
+                recoveryState: mic.recoveryState,
+                initialInput: mic.initialInput
+            )
+            finalizedMetadata = try JSONSerialization.data(
+                withJSONObject: meta,
+                options: [.prettyPrinted, .sortedKeys]
+            )
+        }
+        try finalizedMetadata!.write(
+            to: dir.appendingPathComponent("meta.json"), options: .atomic
+        )
     }
 
     static func makeMetadata(
@@ -87,7 +94,8 @@ final class RecordingSession {
             : .healthy
 
         var microphone: [String: Any] = [
-            "partial": micFirstBufferAt == nil || finalStatus == .failed,
+            "partial": micFirstBufferAt == nil || finalStatus == .failed
+                || !recoveryState.interruptions.isEmpty,
             "final_status": finalStatus.rawValue,
             "interruptions": recoveryState.interruptions.map { interruption in
                 [

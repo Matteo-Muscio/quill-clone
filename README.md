@@ -53,6 +53,17 @@ speaker-identification model. CAF on purpose: unlike m4a, it needs no
 finalization pass — if the process dies mid-meeting, everything already
 written is still readable.
 
+If Quill cannot save a stopped recording's metadata, the menu shows
+**Retry saving recording**. Check available disk space and access to the
+recordings folder, then retry. Capture has stopped; Quill keeps the original
+end time and metadata in memory and prevents another recording or an ordinary
+quit until saving succeeds. Force-quitting before retrying loses that in-memory
+metadata, although any audio already written remains on disk.
+
+Microphone interruptions mark the transcript as partial even if the microphone
+reconnects before the recording ends. Check the warning before relying on the
+transcript as a complete record of the meeting.
+
 ## Transcription
 
 Built in, on-device, automatic. The recommended default is **Parakeet TDT 0.6B
@@ -73,6 +84,21 @@ on next launch, and sessions waiting for a model resume automatically after one
 is downloaded and activated (the filesystem is the queue: a session with
 `meta.json` but no `transcript.json` is pending). Failures append to the
 session's `transcribe.log` and never block later jobs.
+
+Use **Retry pending transcriptions** in the menu after resolving a failure;
+restarting Quill is not required. Repeated retries do not duplicate queued or
+active jobs, and completed transcripts are preserved. The action is unavailable
+while a model is being prepared, transcription is running, a recording still
+needs saving, or transcription is disabled.
+
+If one audio track cannot be transcribed, Quill saves the other track's speech
+and warns that the transcript is incomplete. If every track fails, it reports a
+failure and leaves the session pending for retry. A successfully processed track
+with no speech may legitimately produce an empty transcript. Retry applies to
+pending jobs, not completed partial transcripts.
+
+Quill also restores a missing `transcript.md` from a valid `transcript.json`
+when scanning pending work, without loading a model or repeating transcription.
 
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.

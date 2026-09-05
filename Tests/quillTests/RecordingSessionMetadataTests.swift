@@ -89,9 +89,41 @@ final class RecordingSessionMetadataTests: XCTestCase {
         )
 
         let microphone = try! XCTUnwrap(metadata["microphone"] as? [String: Any])
+        XCTAssertEqual(microphone["partial"] as? Bool, true,
+                       "Recovered capture still contains missing speech")
+        XCTAssertEqual(microphone["final_status"] as? String, "healthy",
+                       "Final device health is independent of recording completeness")
         XCTAssertEqual(microphone["interruptions"] as? [[String: String]], [[
             "started": "1970-01-01T00:16:42Z",
             "ended": "1970-01-01T00:16:44Z",
         ]])
+    }
+
+    func testFailedMetadataSaveCanBeRetriedWithoutChangingEndTimeOrAudio() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let session = try RecordingSession(root: root)
+        let audio = session.dir.appendingPathComponent("mic.caf")
+        let originalAudio = Data("preserved recording".utf8)
+        try originalAudio.write(to: audio)
+        let metadata = session.dir.appendingPathComponent("meta.json")
+        // A directory at the destination reliably simulates a save failure,
+        // including when tests run with permission to bypass file modes.
+        try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false)
+
+        XCTAssertThrowsError(try session.stop())
+        let stoppedAt = try XCTUnwrap(session.endedAt)
+        XCTAssertThrowsError(try session.stop())
+        XCTAssertEqual(session.endedAt, stoppedAt)
+
+        try FileManager.default.removeItem(at: metadata)
+        try session.stop()
+        let saved = try Data(contentsOf: metadata)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: saved) as? [String: Any])
+        XCTAssertEqual(json["ended"] as? String, ISO8601DateFormatter().string(from: stoppedAt))
+        XCTAssertEqual(try Data(contentsOf: audio), originalAudio)
+        XCTAssertEqual(session.endedAt, stoppedAt)
+        try session.stop()
+        XCTAssertEqual(try Data(contentsOf: metadata), saved)
     }
 }
