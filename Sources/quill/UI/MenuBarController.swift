@@ -13,7 +13,8 @@ final class MenuBarController {
     private let saveFailureLabel: NSMenuItem
     private let retrySaveItem: NSMenuItem
     private let retryTranscriptionItem: NSMenuItem
-    private var recordingAccessibilityValue = "Idle"
+    private let setupTranscriptionItem: NSMenuItem
+    private var recordingAccessibilityValue = "Ready to record"
 
     var onToggle: (() -> Void)?
     var onOpenSoundSettings: (() -> Void)?
@@ -23,12 +24,13 @@ final class MenuBarController {
     var onRetrySave: (() -> Void)?
     var onRetryTranscription: (() -> Void)?
 
-    init(menu: NSMenu = NSMenu()) {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    init(menu: NSMenu = NSMenu(), statusItem: NSStatusItem? = nil) {
+        self.statusItem = statusItem
+            ?? NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         menu.autoenablesItems = false
 
-        stateLabel = NSMenuItem(title: "idle", action: nil, keyEquivalent: "")
+        stateLabel = NSMenuItem(title: "Ready to record", action: nil, keyEquivalent: "")
         stateLabel.isEnabled = false
         menu.addItem(stateLabel)
 
@@ -66,6 +68,18 @@ final class MenuBarController {
         )
         menu.addItem(retryTranscriptionItem)
 
+        setupTranscriptionItem = NSMenuItem(
+            title: "Set up transcription…",
+            action: #selector(openSettingsClicked),
+            keyEquivalent: ""
+        )
+        setupTranscriptionItem.image = NSImage(
+            systemSymbolName: "arrow.down.circle",
+            accessibilityDescription: nil
+        )
+        setupTranscriptionItem.isHidden = true
+        menu.addItem(setupTranscriptionItem)
+
         openSoundSettingsItem = NSMenuItem(
             title: "Open Sound Settings…",
             action: #selector(openSoundSettingsClicked),
@@ -99,37 +113,40 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, retrySaveItem, retryTranscriptionItem,
+        for item in [toggleItem, retrySaveItem, retryTranscriptionItem, setupTranscriptionItem,
                      openSoundSettingsItem, openFolder, settings, quit] {
             item.target = self
         }
 
-        statusItem.menu = menu
+        self.statusItem.menu = menu
 
-        if let button = statusItem.button {
-            let image = Self.featherImage()
-            image?.isTemplate = true
-            button.image = image
+        if let button = self.statusItem.button {
             button.imagePosition = .imageLeft
+            button.font = .monospacedDigitSystemFont(
+                ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular
+            )
             button.setAccessibilityLabel("Quill")
-            button.setAccessibilityValue("Idle")
         }
+        update(indicator: .idle, elapsed: nil)
     }
 
     /// Reflect recording state in the icon and menu item titles. The
-    /// menu bar shows only the template icon; the elapsed
-    /// counter lives in the menu's state label. Call once a second while
-    /// recording.
+    /// elapsed counter remains visible in the menu bar while recording,
+    /// including when only system audio is available. Call once a second.
     func update(indicator: RecordingIndicator, elapsed: String?) {
         switch indicator {
         case .idle:
-            stateLabel.title = "idle"
+            stateLabel.title = "Ready to record"
         case .recording:
-            stateLabel.title = "● recording · \(elapsed ?? "0:00")"
+            stateLabel.title = "Recording · \(elapsed ?? "0:00")"
         case .microphoneFailed:
-            stateLabel.title = "Microphone unavailable - system audio still recording"
+            stateLabel.title = "Microphone unavailable — system audio recording"
         }
         toggleItem.title = indicator == .idle ? "Start recording" : "Stop recording"
+        toggleItem.image = NSImage(
+            systemSymbolName: indicator == .idle ? "record.circle" : "stop.circle",
+            accessibilityDescription: nil
+        )
         openSoundSettingsItem.isHidden = indicator != .microphoneFailed
         let image: NSImage?
         switch indicator {
@@ -142,11 +159,12 @@ final class MenuBarController {
         }
         image?.isTemplate = true
         statusItem.button?.image = image
+        statusItem.button?.title = indicator == .idle ? "" : (elapsed ?? "0:00")
         statusItem.button?.setAccessibilityLabel("Quill")
         let accessibilityValue = switch indicator {
-        case .idle: "Idle"
+        case .idle: "Ready to record"
         case .recording: "Recording, \(elapsed ?? "0:00")"
-        case .microphoneFailed: "Microphone unavailable - system audio still recording"
+        case .microphoneFailed: "Microphone unavailable — system audio recording, \(elapsed ?? "0:00")"
         }
         recordingAccessibilityValue = accessibilityValue
         updateAccessibilityValue()
@@ -180,19 +198,20 @@ final class MenuBarController {
     }
 
     private func updateAccessibilityValue() {
-        statusItem.button?.setAccessibilityValue(
-            saveFailureLabel.isHidden
-                ? recordingAccessibilityValue
-                : "Recording stopped, metadata not saved"
-        )
+        let value = saveFailureLabel.isHidden
+            ? recordingAccessibilityValue
+            : "Recording stopped, metadata not saved"
+        statusItem.button?.setAccessibilityValue(value)
+        statusItem.button?.toolTip = value
     }
 
     /// Show transcription progress/failure as a second status line in the
     /// menu; nil hides it. Independent of recording state — a new recording
     /// can run while the last one transcribes.
-    func updateTranscription(_ text: String?) {
+    func updateTranscription(_ text: String?, needsModel: Bool = false) {
         transcriptionLabel.title = text ?? ""
         transcriptionLabel.isHidden = text == nil
+        setupTranscriptionItem.isHidden = !needsModel || text == nil
     }
 
     // Inlined Lucide feather SVG. Keeping it in source means the executable

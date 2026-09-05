@@ -3,15 +3,25 @@ import SwiftUI
 
 @MainActor
 final class SettingsWindowController: NSWindowController {
-    init(modelManager: ModelManager) {
-        let hostingController = NSHostingController(
-            rootView: SettingsView(modelManager: modelManager)
+    private let hostingController: NSHostingController<SettingsView>
+    private let transcriptionEnabled: () -> Bool
+
+    init(
+        modelManager: ModelManager,
+        transcriptionEnabled: @escaping () -> Bool = { Config.transcriptionEnabled() }
+    ) {
+        self.transcriptionEnabled = transcriptionEnabled
+        hostingController = NSHostingController(
+            rootView: SettingsView(
+                modelManager: modelManager,
+                transcriptionEnabled: transcriptionEnabled()
+            )
         )
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Quill Settings"
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        window.setContentSize(NSSize(width: 560, height: 480))
-        window.minSize = NSSize(width: 520, height: 430)
+        window.setContentSize(NSSize(width: 600, height: 540))
+        window.contentMinSize = NSSize(width: 520, height: 430)
         window.isReleasedWhenClosed = false
         window.setFrameAutosaveName("QuillSettingsWindow")
 
@@ -24,6 +34,8 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func show() {
+        // Config can be edited while the daemon is running.
+        hostingController.rootView.transcriptionEnabled = transcriptionEnabled()
         NSApp.activate()
         window?.makeKeyAndOrderFront(nil)
     }
