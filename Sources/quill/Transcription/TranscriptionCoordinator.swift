@@ -63,8 +63,9 @@ actor TranscriptionCoordinator {
             runHook(for: sessionDir)
             return
         }
-        queue.append(sessionDir)
-        drainIfIdle()
+        if !draining { lastFailure = nil }
+        queueIfPending(sessionDir)
+        finishQueueUpdate()
     }
 
     /// Scan the recordings root for sessions that finished (meta.json exists)
@@ -76,22 +77,14 @@ actor TranscriptionCoordinator {
             at: root, includingPropertiesForKeys: nil
         ) else { return }
 
-        let fm = FileManager.default
-        let pending = entries
-            .filter {
-                fm.fileExists(atPath: $0.appendingPathComponent("meta.json").path)
-                    && !fm.fileExists(atPath: $0.appendingPathComponent("transcript.json").path)
-            }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        for dir in pending where dir != inFlight && !queue.contains(dir) {
-            queue.append(dir)
+        if !draining { lastFailure = nil }
+        let pending = entries.filter {
+            FileManager.default.fileExists(atPath: $0.appendingPathComponent("meta.json").path)
+        }.sorted { $0.lastPathComponent < $1.lastPathComponent }
+        for dir in pending {
+            queueIfPending(dir)
         }
-        if !pending.isEmpty {
-            FileHandle.standardError.write(Data(
-                "resuming \(pending.count) untranscribed session(s)\n".utf8
-            ))
-        }
-        drainIfIdle()
+        finishQueueUpdate()
     }
 
     func modelDidActivate(root: URL) {
@@ -100,10 +93,47 @@ actor TranscriptionCoordinator {
 
     // MARK: -
 
+    /// Validate the completion marker instead of trusting mere file presence.
+    /// Older versions could publish JSON before failing to write Markdown.
+    private func queueIfPending(_ sessionDir: URL) {
+        let dir = sessionDir.standardizedFileURL
+        guard dir != inFlight, !queue.contains(dir) else { return }
+        if let transcript = Transcript.read(from: dir) {
+            do {
+                let markdown = dir.appendingPathComponent("transcript.md")
+                let isFile = try? markdown.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile
+                if isFile != true {
+                    try transcript.writeMarkdown(to: dir)
+                    log(dir, "repaired readable transcript from canonical JSON")
+                    if lastFailure == dir.lastPathComponent { lastFailure = nil }
+                }
+            } catch {
+                reportFailure(dir, error)
+            }
+            return
+        }
+        queue.append(dir)
+    }
+
+    private func reportFailure(_ dir: URL, _ error: Error) {
+        log(dir, "transcription failed: \(error)")
+        lastFailure = dir.lastPathComponent
+        notification(
+            "quill — transcription failed",
+            "\(dir.lastPathComponent) — see transcribe.log"
+        )
+    }
+
+    private func finishQueueUpdate() {
+        if !draining, queue.isEmpty {
+            publish(lastFailure.map { .failed(session: $0) } ?? .idle)
+        }
+        drainIfIdle()
+    }
+
     private func drainIfIdle() {
         guard !draining, !queue.isEmpty else { return }
         draining = true
-        lastFailure = nil
         Task { await drain() }
     }
 
@@ -134,19 +164,13 @@ actor TranscriptionCoordinator {
             inFlight = dir
             publish(.transcribing(session: dir.lastPathComponent, queued: queue.count))
             do {
-                let partial = try await transcribe(dir, model: model)
-                let body = partial
-                    ? "\(dir.lastPathComponent) — microphone audio is incomplete"
-                    : dir.lastPathComponent
+                let warning = try await transcribe(dir, model: model)
+                let body = warning.map { "\(dir.lastPathComponent) — \($0)" }
+                    ?? dir.lastPathComponent
                 notification("quill — transcript ready", body)
                 runHook(for: dir)
             } catch {
-                log(dir, "transcription failed: \(error)")
-                lastFailure = dir.lastPathComponent
-                notification(
-                    "quill — transcription failed",
-                    "\(dir.lastPathComponent) — see transcribe.log"
-                )
+                reportFailure(dir, error)
             }
             inFlight = nil
         }
@@ -159,15 +183,18 @@ actor TranscriptionCoordinator {
         drainIfIdle()
     }
 
-    private func transcribe(_ dir: URL, model: TranscriptionModel) async throws -> Bool {
+    private func transcribe(_ dir: URL, model: TranscriptionModel) async throws -> String? {
         let meta = try SessionMeta.read(from: dir)
         let engine = try await preparedEngine(for: model)
 
         var merged: [Transcript.Segment] = []
+        var successfulTracks = 0
+        var failedTracks: [String] = []
         for track in meta.tracks {
             let audio = dir.appendingPathComponent(track.file)
             guard FileManager.default.fileExists(atPath: audio.path) else {
                 log(dir, "skipping missing track \(track.file)")
+                failedTracks.append(track.file)
                 continue
             }
             log(dir, "transcribing \(track.file) (\(engine.name))")
@@ -178,8 +205,10 @@ actor TranscriptionCoordinator {
                 segments = try await engine.transcribe(audio)
             } catch {
                 log(dir, "skipping \(track.file): \(error)")
+                failedTracks.append(track.file)
                 continue
             }
+            successfulTracks += 1
             let offset = TimeInterval(track.offsetMs) / 1000
             merged += segments.map {
                 Transcript.Segment(
@@ -190,18 +219,38 @@ actor TranscriptionCoordinator {
                 )
             }
         }
+        guard successfulTracks > 0 else {
+            throw TranscriptionError.noSuccessfulTracks
+        }
         merged.sort { $0.start_ms < $1.start_ms }
+        var warnings: [String] = []
+        if meta.microphonePartial {
+            warnings.append("microphone capture was incomplete and some of the user's speech may be missing.")
+        }
+        if !failedTracks.isEmpty {
+            warnings.append("audio could not be transcribed from: \(failedTracks.joined(separator: ", ")). Some speech may be missing.")
+        }
 
         let transcript = Transcript(
             engine: engine.name,
             model: engine.model,
             created_at: ISO8601DateFormatter().string(from: Date()),
-            partial: meta.microphonePartial,
+            partial: !warnings.isEmpty,
+            warning: warnings.isEmpty ? nil : warnings.joined(separator: " "),
             segments: merged
         )
         try transcript.write(to: dir)
         log(dir, "done — \(merged.count) segments")
-        return meta.microphonePartial
+        if !failedTracks.isEmpty { return "audio is incomplete" }
+        return meta.microphonePartial ? "microphone audio is incomplete" : nil
+    }
+
+    private enum TranscriptionError: Error, CustomStringConvertible {
+        case noSuccessfulTracks
+
+        var description: String {
+            "no audio tracks were successfully transcribed; recording remains pending for retry"
+        }
     }
 
     private func preparedEngine(for model: TranscriptionModel) async throws
@@ -293,9 +342,11 @@ private struct SessionMeta {
             tracks.append(Track(file: system, speaker: "them", offsetMs: offsets["system"] ?? 0))
         }
         let microphone = json["microphone"] as? [String: Any]
+        let interruptions = microphone?["interruptions"] as? [[String: Any]] ?? []
         return SessionMeta(
             tracks: tracks,
-            microphonePartial: microphone?["partial"] as? Bool ?? false
+            microphonePartial: (microphone?["partial"] as? Bool ?? false)
+                || !interruptions.isEmpty
         )
     }
 }
@@ -314,16 +365,50 @@ private struct Transcript: Codable {
     let model: String
     let created_at: String
     let partial: Bool
+    let warning: String?
     let segments: [Segment]
 
-    /// Write transcript.json and render transcript.md. Both writes are atomic
-    /// (temp file + rename), so a partially written transcript never exists on
-    /// disk — resumePending treats presence of transcript.json as "done".
+    enum CodingKeys: String, CodingKey {
+        case engine, model, created_at, partial, warning, segments
+    }
+
+    init(engine: String, model: String, created_at: String, partial: Bool,
+         warning: String?, segments: [Segment]) {
+        self.engine = engine
+        self.model = model
+        self.created_at = created_at
+        self.partial = partial
+        self.warning = warning
+        self.segments = segments
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        engine = try values.decode(String.self, forKey: .engine)
+        model = try values.decode(String.self, forKey: .model)
+        created_at = try values.decode(String.self, forKey: .created_at)
+        partial = try values.decodeIfPresent(Bool.self, forKey: .partial) ?? false
+        warning = try values.decodeIfPresent(String.self, forKey: .warning)
+        segments = try values.decode([Segment].self, forKey: .segments)
+    }
+
+    static func read(from dir: URL) -> Transcript? {
+        guard let data = try? Data(contentsOf: dir.appendingPathComponent("transcript.json"))
+        else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
+    }
+
+    /// Publish Markdown first and the canonical completion marker last. A
+    /// failed write leaves the session retryable; each file write is atomic.
     func write(to dir: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(self)
-            .write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
+        let data = try encoder.encode(self)
+        try writeMarkdown(to: dir)
+        try data.write(to: dir.appendingPathComponent("transcript.json"), options: .atomic)
+    }
+
+    func writeMarkdown(to dir: URL) throws {
         try Data(rendered(title: dir.lastPathComponent).utf8)
             .write(to: dir.appendingPathComponent("transcript.md"), options: .atomic)
     }
@@ -332,7 +417,7 @@ private struct Transcript: Codable {
         var lines = ["# \(title)", ""]
         if partial {
             lines += [
-                "Warning: microphone capture was incomplete and some of the user's speech may be missing.",
+                "Warning: \(warning ?? "audio is incomplete and some speech may be missing.")",
                 "",
             ]
         }

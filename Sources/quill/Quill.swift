@@ -85,6 +85,7 @@ struct AppBusyState {
     var isRecording = false
     var isTranscribing = false
     var isPreparingModel = false
+    var hasUnsavedRecording = false
     var micHealth: MicCaptureHealth = .healthy
 
     var recordingIndicator: RecordingIndicator {
@@ -97,12 +98,16 @@ struct AppBusyState {
     }
 
     var canStartRecording: Bool {
-        !isPreparingModel
+        !isPreparingModel && !hasUnsavedRecording
+    }
+
+    var canRetryTranscription: Bool {
+        !isPreparingModel && !isTranscribing && !hasUnsavedRecording
     }
 
     mutating func finishRecording(transcriptionEnabled: Bool) {
         isRecording = false
-        isTranscribing = transcriptionEnabled
+        isTranscribing = isTranscribing || transcriptionEnabled
     }
 }
 
@@ -116,6 +121,7 @@ final class AppController {
     private let modelManager: ModelManager
     private let settingsWindow: SettingsWindowController
     private var session: RecordingSession?
+    private var pendingSave: RecordingSession?
     private var ticker: Timer?
     private var busyState = AppBusyState()
     private var hasNotifiedMicrophoneFailure = false
@@ -146,6 +152,8 @@ final class AppController {
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.onOpenSoundSettings = { [weak self] in self?.openSoundSettings() }
+        menuBar.onRetrySave = { [weak self] in self?.retrySave() }
+        menuBar.onRetryTranscription = { [weak self] in self?.retryTranscription() }
         menuBar.update(indicator: .idle, elapsed: nil)
 
         modelManager.$isPreparingModel
@@ -168,6 +176,13 @@ final class AppController {
     /// Stop any live session cleanly (finalizing files) and exit.
     func shutdown() {
         stopSession()
+        guard pendingSave == nil else {
+            notifyUser(
+                title: "quill — recording not saved",
+                body: "Use Retry saving recording before quitting. Check disk space and folder access."
+            )
+            return
+        }
         statusTask?.cancel()
         NSApp.terminate(nil)
     }
@@ -208,8 +223,9 @@ final class AppController {
 
     private func stopSession() {
         guard let session else { return }
-        session.stop()
-        let elapsed = Self.format(Date().timeIntervalSince(session.startedAt))
+        session.onMicHealthChange = nil
+        let saved = save(session)
+        let elapsed = Self.format((session.endedAt ?? Date()).timeIntervalSince(session.startedAt))
         FileHandle.standardError.write(Data(
             "○ stopped · \(elapsed) · \(session.dir.path)\n".utf8
         ))
@@ -217,15 +233,54 @@ final class AppController {
         busyState.micHealth = .healthy
         hasNotifiedMicrophoneFailure = false
         busyState.finishRecording(
-            transcriptionEnabled: Config.transcriptionEnabled()
+            transcriptionEnabled: saved && Config.transcriptionEnabled()
         )
         syncBusyState()
         ticker?.invalidate()
         ticker = nil
         menuBar.update(indicator: busyState.recordingIndicator, elapsed: nil)
 
-        let dir = session.dir
-        Task { [transcription] in await transcription.enqueue(dir) }
+        if saved {
+            let dir = session.dir
+            Task { [transcription] in await transcription.enqueue(dir) }
+        }
+    }
+
+    /// Keep the stopped session alive until its metadata is safely on disk.
+    private func save(_ recording: RecordingSession) -> Bool {
+        do {
+            try recording.stop()
+            pendingSave = nil
+            busyState.hasUnsavedRecording = false
+            return true
+        } catch {
+            pendingSave = recording
+            busyState.hasUnsavedRecording = true
+            FileHandle.standardError.write(Data(
+                "recording metadata save failed · \(recording.dir.path): \(error)\n".utf8
+            ))
+            notifyUser(
+                title: "quill — recording not saved",
+                body: "Audio capture has stopped. Check disk space and folder access, then choose Retry saving recording."
+            )
+            return false
+        }
+    }
+
+    private func retrySave() {
+        guard let pendingSave else { return }
+        let saved = save(pendingSave)
+        if saved {
+            busyState.finishRecording(transcriptionEnabled: Config.transcriptionEnabled())
+            let dir = pendingSave.dir
+            Task { [transcription] in await transcription.enqueue(dir) }
+        }
+        syncBusyState()
+    }
+
+    private func retryTranscription() {
+        guard busyState.canRetryTranscription, Config.transcriptionEnabled() else { return }
+        Task { [transcription, root] in await transcription.resumePending(root: root) }
     }
 
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {
@@ -260,7 +315,12 @@ final class AppController {
         modelManager.actionsLocked = busyState.modelActionsLocked
         menuBar.updateModelPreparation(
             busyState.isPreparingModel,
-            recording: busyState.isRecording
+            recording: busyState.isRecording,
+            hasUnsavedRecording: busyState.hasUnsavedRecording
+        )
+        menuBar.updatePendingSave(pendingSave?.dir.lastPathComponent)
+        menuBar.updateRetryTranscription(
+            enabled: busyState.canRetryTranscription && Config.transcriptionEnabled()
         )
     }
 

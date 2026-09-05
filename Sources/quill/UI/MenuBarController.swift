@@ -10,17 +10,22 @@ final class MenuBarController {
     private let transcriptionLabel: NSMenuItem
     private let toggleItem: NSMenuItem
     private let openSoundSettingsItem: NSMenuItem
+    private let saveFailureLabel: NSMenuItem
+    private let retrySaveItem: NSMenuItem
+    private let retryTranscriptionItem: NSMenuItem
+    private var recordingAccessibilityValue = "Idle"
 
     var onToggle: (() -> Void)?
     var onOpenSoundSettings: (() -> Void)?
     var onOpenSettings: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
+    var onRetrySave: (() -> Void)?
+    var onRetryTranscription: (() -> Void)?
 
-    init() {
+    init(menu: NSMenu = NSMenu()) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
-        let menu = NSMenu()
         menu.autoenablesItems = false
 
         stateLabel = NSMenuItem(title: "idle", action: nil, keyEquivalent: "")
@@ -32,6 +37,11 @@ final class MenuBarController {
         transcriptionLabel.isHidden = true
         menu.addItem(transcriptionLabel)
 
+        saveFailureLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        saveFailureLabel.isEnabled = false
+        saveFailureLabel.isHidden = true
+        menu.addItem(saveFailureLabel)
+
         menu.addItem(.separator())
 
         toggleItem = NSMenuItem(
@@ -40,6 +50,21 @@ final class MenuBarController {
             keyEquivalent: "r"
         )
         menu.addItem(toggleItem)
+
+        retrySaveItem = NSMenuItem(
+            title: "Retry saving recording",
+            action: #selector(retrySaveClicked),
+            keyEquivalent: ""
+        )
+        retrySaveItem.isHidden = true
+        menu.addItem(retrySaveItem)
+
+        retryTranscriptionItem = NSMenuItem(
+            title: "Retry pending transcriptions",
+            action: #selector(retryTranscriptionClicked),
+            keyEquivalent: ""
+        )
+        menu.addItem(retryTranscriptionItem)
 
         openSoundSettingsItem = NSMenuItem(
             title: "Open Sound Settings…",
@@ -74,7 +99,8 @@ final class MenuBarController {
         )
         menu.addItem(quit)
 
-        for item in [toggleItem, openSoundSettingsItem, openFolder, settings, quit] {
+        for item in [toggleItem, retrySaveItem, retryTranscriptionItem,
+                     openSoundSettingsItem, openFolder, settings, quit] {
             item.target = self
         }
 
@@ -122,16 +148,43 @@ final class MenuBarController {
         case .recording: "Recording, \(elapsed ?? "0:00")"
         case .microphoneFailed: "Microphone unavailable - system audio still recording"
         }
-        statusItem.button?.setAccessibilityValue(accessibilityValue)
+        recordingAccessibilityValue = accessibilityValue
+        updateAccessibilityValue()
     }
 
     /// Prevent a new recording while model download or verification is active.
     /// An existing recording can always be stopped.
-    func updateModelPreparation(_ isPreparing: Bool, recording: Bool) {
-        toggleItem.isEnabled = recording || !isPreparing
-        toggleItem.toolTip = isPreparing && !recording
-            ? "Recording is unavailable while a transcription model is being prepared"
-            : nil
+    func updateModelPreparation(
+        _ isPreparing: Bool, recording: Bool, hasUnsavedRecording: Bool = false
+    ) {
+        toggleItem.isEnabled = recording || (!isPreparing && !hasUnsavedRecording)
+        toggleItem.toolTip = nil
+        if !recording {
+            if hasUnsavedRecording {
+                toggleItem.toolTip = "Retry saving the stopped recording before starting another"
+            } else if isPreparing {
+                toggleItem.toolTip = "Recording is unavailable while a transcription model is being prepared"
+            }
+        }
+    }
+
+    func updatePendingSave(_ session: String?) {
+        saveFailureLabel.title = session.map { "Recording not saved · \($0)" } ?? ""
+        saveFailureLabel.isHidden = session == nil
+        retrySaveItem.isHidden = session == nil
+        updateAccessibilityValue()
+    }
+
+    func updateRetryTranscription(enabled: Bool) {
+        retryTranscriptionItem.isEnabled = enabled
+    }
+
+    private func updateAccessibilityValue() {
+        statusItem.button?.setAccessibilityValue(
+            saveFailureLabel.isHidden
+                ? recordingAccessibilityValue
+                : "Recording stopped, metadata not saved"
+        )
     }
 
     /// Show transcription progress/failure as a second status line in the
@@ -183,4 +236,6 @@ final class MenuBarController {
     @objc private func openSettingsClicked() { onOpenSettings?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
     @objc private func quitClicked() { onQuit?() }
+    @objc private func retrySaveClicked() { onRetrySave?() }
+    @objc private func retryTranscriptionClicked() { onRetryTranscription?() }
 }

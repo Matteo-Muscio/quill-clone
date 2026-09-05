@@ -347,6 +347,327 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         ))
     }
 
+    func testLegacyRecoveredMicrophoneInterruptionStillWarns() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("legacy-interruption", in: root)
+        try Data(#"{"files":{"mic":"mic.caf"},"microphone":{"partial":false,"health":"healthy","interruptions":[{"cause":"route_change"}]}}"#.utf8)
+            .write(to: session.appendingPathComponent("meta.json"))
+        let (coordinator, statuses, notifications) = coordinator(using: TestEngine())
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "idle" }
+        XCTAssertEqual(try readTranscript(session)["partial"] as? Bool, true)
+        XCTAssertEqual(notifications.value.last?.1, "legacy-interruption — microphone audio is incomplete")
+        let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
+        XCTAssertTrue(markdown.contains("microphone capture was incomplete"))
+    }
+
+    func testOneFailedTrackPreservesOtherSpeechAndMarksPartial() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("one-failed", in: root)
+        try addSystemTrack(to: session)
+        let engine = TestEngine(failedFiles: ["mic.caf"])
+        let (coordinator, statuses, notifications) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "idle" }
+
+        let transcript = try readTranscript(session)
+        XCTAssertEqual(transcript["partial"] as? Bool, true)
+        let segments = try XCTUnwrap(transcript["segments"] as? [[String: Any]])
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments.first?["text"] as? String, "system.caf")
+        XCTAssertEqual(segments.first?["speaker"] as? String, "them")
+        let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
+        XCTAssertTrue(markdown.contains("audio could not be transcribed from: mic.caf"))
+        XCTAssertEqual(notifications.value.last?.1, "one-failed — audio is incomplete")
+    }
+
+    func testMissingDeclaredTrackMarksPartialWithoutLosingGoodTrack() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("missing-track", in: root)
+        try addSystemTrack(to: session, createAudio: false)
+        let engine = TestEngine()
+        let (coordinator, statuses, _) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "idle" }
+        let transcript = try readTranscript(session)
+        XCTAssertEqual(transcript["partial"] as? Bool, true)
+        XCTAssertEqual((transcript["segments"] as? [[String: Any]])?.count, 1)
+        XCTAssertTrue((transcript["warning"] as? String)?.contains("system.caf") == true)
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 1)
+    }
+
+    func testAllTracksFailRemainPendingAndCanRetrySuccessfully() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("all-failed", in: root)
+        try addSystemTrack(to: session)
+        let engine = TestEngine(failedFiles: ["mic.caf", "system.caf"])
+        let (coordinator, statuses, notifications) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "failed:all-failed" }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.json").path))
+        XCTAssertEqual(notifications.value.last?.0, "quill — transcription failed")
+
+        await engine.allowAllTracks()
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "idle" }
+        XCTAssertEqual((try readTranscript(session)["segments"] as? [[String: Any]])?.count, 2)
+    }
+
+    func testAllMissingAndUnsupportedTracksNeverPublishCompletion() async throws {
+        let root = try temporaryRoot()
+        let missing = try makeSession("all-missing", in: root)
+        try FileManager.default.removeItem(at: missing.appendingPathComponent("mic.caf"))
+        let unsupported = try makeSession("unsupported", in: root)
+        try Data(#"{"files":{"other":"other.caf"}}"#.utf8)
+            .write(to: unsupported.appendingPathComponent("meta.json"))
+        let engine = TestEngine()
+        let (coordinator, statuses, notifications) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "failed:unsupported" }
+        for session in [missing, unsupported] {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.json").path))
+        }
+        XCTAssertEqual(notifications.value.filter { $0.0 == "quill — transcription failed" }.count, 2)
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 0)
+    }
+
+    func testSuccessfulSilentTrackIsACompleteEmptyTranscript() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("silent", in: root)
+        let (coordinator, statuses, _) = coordinator(using: TestEngine(emptySpeech: true))
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "idle" }
+        let transcript = try readTranscript(session)
+        XCTAssertEqual(transcript["partial"] as? Bool, false)
+        XCTAssertEqual((transcript["segments"] as? [[String: Any]])?.count, 0)
+    }
+
+    func testMarkdownWriteFailureDoesNotPublishJSONAndRetryRepairsPair() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("write-failed", in: root)
+        let markdown = session.appendingPathComponent("transcript.md")
+        try FileManager.default.createDirectory(at: markdown, withIntermediateDirectories: false)
+        let (coordinator, statuses, notifications) = coordinator(using: TestEngine())
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "failed:write-failed" }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.json").path))
+        XCTAssertEqual(notifications.value.last?.0, "quill — transcription failed")
+        try FileManager.default.removeItem(at: markdown)
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "idle" }
+        XCTAssertNoThrow(try readTranscript(session))
+        XCTAssertTrue(try String(contentsOf: markdown, encoding: .utf8).contains("mic.caf"))
+    }
+
+    func testJSONWriteFailureLeavesReadableOutputAndCanRetry() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("json-failed", in: root)
+        let canonical = session.appendingPathComponent("transcript.json")
+        try FileManager.default.createDirectory(at: canonical, withIntermediateDirectories: false)
+        let (coordinator, statuses, _) = coordinator(using: TestEngine())
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "failed:json-failed" }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.md").path))
+        XCTAssertThrowsError(try readTranscript(session))
+        try FileManager.default.removeItem(at: canonical)
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "idle" }
+        XCTAssertNoThrow(try readTranscript(session))
+    }
+
+    func testLegacyCanonicalRepairsMarkdownWithoutInferenceOrModel() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("legacy", in: root)
+        let canonical = session.appendingPathComponent("transcript.json")
+        let original = Data(#"{"engine":"legacy","model":"old","created_at":"then","segments":[{"speaker":"me","start_ms":0,"end_ms":1000,"text":"saved speech"}]}"#.utf8)
+        try original.write(to: canonical)
+        let probes = Locked(0)
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true },
+            isModelInstalled: { _ in probes.update { $0 += 1 }; return false },
+            makeEngine: { _ in TestEngine() },
+            notification: { _, _ in }
+        )
+        await coordinator.resumePending(root: root)
+        XCTAssertTrue(try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8).contains("saved speech"))
+        XCTAssertEqual(try Data(contentsOf: canonical), original)
+        XCTAssertEqual(probes.value, 0)
+        await coordinator.enqueue(session)
+        XCTAssertEqual(try Data(contentsOf: canonical), original)
+    }
+
+    func testLegacyRepairFailureIsSurfacedAndRetryDoesNotRunInference() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("repair-failed", in: root)
+        let canonical = session.appendingPathComponent("transcript.json")
+        let original = Data(#"{"engine":"legacy","model":"old","created_at":"then","partial":true,"segments":[]}"#.utf8)
+        try original.write(to: canonical)
+        let markdown = session.appendingPathComponent("transcript.md")
+        try FileManager.default.createDirectory(at: markdown, withIntermediateDirectories: false)
+        let engine = TestEngine()
+        let (coordinator, statuses, notifications) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        XCTAssertEqual(statuses.value.last, "failed:repair-failed")
+        XCTAssertEqual(notifications.value.last?.0, "quill — transcription failed")
+        XCTAssertEqual(try Data(contentsOf: canonical), original)
+        try FileManager.default.removeItem(at: markdown)
+        await coordinator.resumePending(root: root)
+        XCTAssertEqual(statuses.value.last, "idle")
+        XCTAssertTrue(try String(contentsOf: markdown, encoding: .utf8).contains("Warning:"))
+        XCTAssertEqual(try Data(contentsOf: canonical), original)
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 0)
+    }
+
+    func testLegacyRepairFailureRemainsVisibleAfterSuccessfulQueuedSession() async throws {
+        let root = try temporaryRoot()
+        let failed = try makeUnrepairableLegacySession("a-repair-failed", in: root)
+        let good = try makeSession("b-good", in: root)
+        let (coordinator, statuses, _) = coordinator(using: TestEngine())
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "failed:a-repair-failed" }
+        XCTAssertNoThrow(try readTranscript(good))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: failed.appendingPathComponent("transcribe.log").path))
+        XCTAssertFalse(statuses.value.contains("idle"))
+    }
+
+    func testRepairFailureDuringActiveTranscriptionPreservesBusyStatus() async throws {
+        let root = try temporaryRoot()
+        let good = try makeSession("active", in: root)
+        let gate = TestGate()
+        let engine = TestEngine(transcribeGate: gate)
+        let (coordinator, statuses, notifications) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(good)
+        await gate.waitUntilEntered()
+        _ = try makeUnrepairableLegacySession("repair-failed", in: root)
+        await coordinator.resumePending(root: root)
+        XCTAssertEqual(statuses.value.last, "transcribing:active:0")
+        XCTAssertEqual(notifications.value.last?.0, "quill — transcription failed")
+        await gate.open()
+        await waitUntil { statuses.value.last == "failed:repair-failed" }
+        XCTAssertNoThrow(try readTranscript(good))
+        XCTAssertFalse(statuses.value.contains("idle"))
+    }
+
+    private func makeUnrepairableLegacySession(_ name: String, in root: URL) throws -> URL {
+        let session = try makeSession(name, in: root)
+        try Data(#"{"engine":"legacy","model":"old","created_at":"then","segments":[]}"#.utf8)
+            .write(to: session.appendingPathComponent("transcript.json"))
+        try FileManager.default.createDirectory(
+            at: session.appendingPathComponent("transcript.md"), withIntermediateDirectories: false
+        )
+        return session
+    }
+
+    func testMalformedCanonicalIsRetried() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("malformed", in: root)
+        try Data("{}".utf8).write(to: session.appendingPathComponent("transcript.json"))
+        let engine = TestEngine()
+        let (coordinator, statuses, _) = coordinator(using: engine)
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.last == "idle" }
+        XCTAssertEqual(try readTranscript(session)["engine"] as? String, "test")
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 1)
+    }
+
+    func testExplicitEnqueueDeduplicatesQueuedInFlightAndCompleteSessions() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("deduplicated", in: root)
+        let gate = TestGate()
+        let installed = Locked(false)
+        let engine = TestEngine(transcribeGate: gate)
+        let statuses = Locked<[String]>([])
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true },
+            isModelInstalled: { _ in installed.value },
+            makeEngine: { _ in engine }, notification: { _, _ in }
+        )
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.enqueue(session)
+        await waitUntil { statuses.value.last == "waiting:1" }
+        await coordinator.enqueue(session)
+        await coordinator.resumePending(root: root)
+        installed.set(true)
+        await coordinator.resumePending(root: root)
+        await gate.waitUntilEntered()
+        await coordinator.enqueue(session)
+        await coordinator.resumePending(root: root)
+        await gate.open()
+        await waitUntil { statuses.value.last == "idle" }
+        let original = try Data(contentsOf: session.appendingPathComponent("transcript.json"))
+        await coordinator.enqueue(session)
+        await coordinator.resumePending(root: root)
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(try Data(contentsOf: session.appendingPathComponent("transcript.json")), original)
+    }
+
+    private func coordinator(using engine: TestEngine) -> (
+        TranscriptionCoordinator, Locked<[String]>, Locked<[(String, String)]>
+    ) {
+        let statuses = Locked<[String]>([])
+        let notifications = Locked<[(String, String)]>([])
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, selectedModel: { .parakeetV3 },
+            isModelInstalled: { _ in true }, makeEngine: { _ in engine },
+            notification: { title, body in notifications.update { $0.append((title, body)) } }
+        )
+        return (coordinator, statuses, notifications)
+    }
+
+    private func addSystemTrack(to session: URL, createAudio: Bool = true) throws {
+        try Data(#"{"files":{"mic":"mic.caf","system":"system.caf"}}"#.utf8)
+            .write(to: session.appendingPathComponent("meta.json"))
+        if createAudio { try Data([1]).write(to: session.appendingPathComponent("system.caf")) }
+    }
+
+    private func readTranscript(_ session: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: session.appendingPathComponent("transcript.json"))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
     private static func label(for status: TranscriptionCoordinator.Status) -> String {
         switch status {
         case .idle:
@@ -407,17 +728,23 @@ private actor TestEngine: TranscriptionEngine {
     private(set) var transcribeCount = 0
     private(set) var releaseCount = 0
     private let prepareFails: Bool
+    private var failedFiles: Set<String>
+    private let emptySpeech: Bool
     private let transcribeGate: TestGate?
     private let releaseGate: TestGate?
 
     init(
         model: String = "test-model",
         prepareFails: Bool = false,
+        failedFiles: Set<String> = [],
+        emptySpeech: Bool = false,
         transcribeGate: TestGate? = nil,
         releaseGate: TestGate? = nil
     ) {
         self.model = model
         self.prepareFails = prepareFails
+        self.failedFiles = failedFiles
+        self.emptySpeech = emptySpeech
         self.transcribeGate = transcribeGate
         self.releaseGate = releaseGate
     }
@@ -429,9 +756,13 @@ private actor TestEngine: TranscriptionEngine {
         }
     }
 
-    func transcribe(_ audio: URL) async -> [TranscriptSegment] {
+    func allowAllTracks() { failedFiles = [] }
+
+    func transcribe(_ audio: URL) async throws -> [TranscriptSegment] {
         transcribeCount += 1
         await transcribeGate?.wait()
+        if failedFiles.contains(audio.lastPathComponent) { throw TestError.expected }
+        if emptySpeech { return [] }
         return [TranscriptSegment(start: 0, end: 1, text: audio.lastPathComponent)]
     }
 

@@ -70,4 +70,49 @@ final class AppControllerStateTests: XCTestCase {
 
         XCTAssertEqual(state.recordingIndicator, .recording)
     }
+
+    func testUnsavedRecordingBlocksNewCaptureAndTranscriptionRetryUntilSaved() {
+        var state = AppBusyState()
+        state.isRecording = true
+        state.hasUnsavedRecording = true
+        state.finishRecording(transcriptionEnabled: false)
+
+        XCTAssertFalse(state.isRecording)
+        XCTAssertFalse(state.isTranscribing)
+        XCTAssertFalse(state.canStartRecording)
+        XCTAssertFalse(state.canRetryTranscription)
+        XCTAssertEqual(state.recordingIndicator, .idle)
+
+        state.hasUnsavedRecording = false
+        state.finishRecording(transcriptionEnabled: true)
+        XCTAssertTrue(state.canStartRecording)
+        XCTAssertTrue(state.isTranscribing)
+        XCTAssertTrue(state.modelActionsLocked)
+    }
+
+    func testFailedSaveDoesNotUnlockAnEarlierTranscription() {
+        var state = AppBusyState()
+        state.isRecording = true
+        state.isTranscribing = true
+        state.hasUnsavedRecording = true
+
+        state.finishRecording(transcriptionEnabled: false)
+
+        XCTAssertTrue(state.isTranscribing)
+        XCTAssertTrue(state.modelActionsLocked)
+    }
+
+    func testRetryTranscriptionWaitsForModelPreparationAndActiveJob() {
+        var state = AppBusyState()
+        XCTAssertTrue(state.canRetryTranscription)
+        state.isPreparingModel = true
+        XCTAssertFalse(state.canRetryTranscription)
+        state.isPreparingModel = false
+        state.isTranscribing = true
+        XCTAssertFalse(state.canRetryTranscription)
+        state.isTranscribing = false
+        state.isRecording = true
+        XCTAssertTrue(state.canRetryTranscription,
+                      "Older sessions may transcribe while a new session records")
+    }
 }
