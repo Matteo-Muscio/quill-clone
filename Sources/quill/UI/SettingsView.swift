@@ -1,34 +1,103 @@
 import SwiftUI
 
+/// A small presentation value keeps readiness copy consistent with the controls
+/// below it, including when automatic transcription is disabled in config.
+struct ModelSettingsSummary: Equatable {
+    let title: String
+    let detail: String
+    let symbol: String
+
+    init(
+        activeModel: TranscriptionModel,
+        activeState: ModelState,
+        isPreparing: Bool,
+        actionsLocked: Bool,
+        pendingCount: Int,
+        transcriptionEnabled: Bool
+    ) {
+        if isPreparing {
+            title = "Preparing a model"
+            detail = "Recording is unavailable until preparation finishes or is cancelled."
+            symbol = "arrow.down.circle"
+        } else if actionsLocked {
+            title = "Model changes are paused"
+            detail = "Finish recording or wait for transcription to complete to change models."
+            symbol = "lock"
+        } else if !transcriptionEnabled {
+            title = "Automatic transcription is off"
+            detail = "Recordings are saved as audio. Enable transcription in your Quill config to transcribe them."
+            symbol = "waveform"
+        } else if pendingCount > 0 {
+            title = "\(pendingCount) recording\(pendingCount == 1 ? "" : "s") waiting"
+            detail = "Download or activate a model below. Waiting recordings resume automatically."
+            symbol = "clock"
+        } else if activeState == .active {
+            title = "Ready to transcribe"
+            detail = "New recordings use \(activeModel.displayName) on this Mac."
+            symbol = "checkmark.circle"
+        } else {
+            title = "Set up transcription"
+            detail = "You can record now. Download a model below to transcribe your recordings."
+            symbol = "arrow.down.circle"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
+    var transcriptionEnabled: Bool
+
+    private var summary: ModelSettingsSummary {
+        ModelSettingsSummary(
+            activeModel: modelManager.activeModel,
+            activeState: modelManager.state(for: modelManager.activeModel),
+            isPreparing: modelManager.isPreparingModel,
+            actionsLocked: modelManager.actionsLocked,
+            pendingCount: modelManager.pendingCount,
+            transcriptionEnabled: transcriptionEnabled
+        )
+    }
 
     var body: some View {
-        Form {
-            if modelManager.pendingCount > 0 {
-                Section {
-                    Label(
-                        "\(modelManager.pendingCount) recording\(modelManager.pendingCount == 1 ? "" : "s") waiting for a transcription model",
-                        systemImage: "clock.badge.exclamationmark"
-                    )
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel(
-                        "\(modelManager.pendingCount) pending transcription\(modelManager.pendingCount == 1 ? "" : "s")"
-                    )
-                }
-            }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Text("Transcription")
+                    .font(.title.weight(.semibold))
+                    .accessibilityAddTraits(.isHeader)
 
-            Section {
-                ForEach(TranscriptionModel.allCases) { model in
-                    ModelRow(model: model, manager: modelManager)
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: summary.symbol)
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(summary.title)
+                            .font(.headline)
+                        Text(summary.detail)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-            } header: {
-                Text("Transcription Model")
-            } footer: {
-                Text("Models run locally. Audio and transcripts do not leave this Mac.")
+                .accessibilityElement(children: .combine)
+
+                VStack(spacing: 0) {
+                    ForEach(TranscriptionModel.allCases) { model in
+                        Divider()
+                        ModelRow(model: model, manager: modelManager)
+                    }
+                    Divider()
+                }
+
+                Label("Models run locally. Audio and transcripts stay on this Mac.", systemImage: "lock.shield")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .formStyle(.grouped)
+        .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 520, minHeight: 430)
     }
 }
@@ -37,93 +106,64 @@ private struct ModelRow: View {
     let model: TranscriptionModel
     @ObservedObject var manager: ModelManager
 
-    private var state: ModelState {
-        manager.state(for: model)
-    }
+    private var state: ModelState { manager.state(for: model) }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            stateIcon
-                .font(.title2)
-                .frame(width: 24)
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text(model.displayName)
-                        .font(.headline)
-
-                    if model.isRecommended {
-                        Text("Recommended")
-                            .font(.caption.weight(.semibold))
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
-                            .background(.tint.opacity(0.14), in: Capsule())
-                            .foregroundStyle(.tint)
-                            .accessibilityLabel("Recommended model")
-                    }
-                }
-
-                Text(model.providerName)
-                    .font(.caption)
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(model.displayName)
+                    .font(.headline)
+                    .accessibilityAddTraits(.isHeader)
+                Text(model.isRecommended ? "Recommended · \(model.providerName) · \(model.approximateSize)" : "\(model.providerName) · \(model.approximateSize)")
+                    .font(.callout)
                     .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
                 Text(model.recommendation)
                 Text(model.languageSummary)
                     .foregroundStyle(.secondary)
-
-                HStack(spacing: 12) {
-                    Label(model.approximateSize, systemImage: "internaldrive")
-                    Label("Local only", systemImage: "lock.shield")
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-                stateDetail
             }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
 
-            Spacer(minLength: 12)
-            action
+            stateDetail
+
+            HStack(spacing: 12) {
+                stateLabel
+                    .font(.callout)
+                Spacer(minLength: 8)
+                action
+                    .buttonStyle(.bordered)
+                    .buttonBorderShape(.roundedRectangle(radius: 5))
+                    .controlSize(.regular)
+            }
         }
-        .padding(.vertical, 8)
+        .padding(.vertical, 18)
     }
 
     @ViewBuilder
-    private var stateIcon: some View {
+    private var stateLabel: some View {
         switch state {
-        case .notInstalled:
-            Image(systemName: "arrow.down.circle")
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("Not downloaded")
-                .help("This model is not downloaded")
-        case .downloading:
-            Image(systemName: "arrow.down.circle.fill")
-                .foregroundStyle(.tint)
-                .accessibilityLabel("Downloading")
-                .help("This model is downloading")
-        case .verifying:
-            Image(systemName: "checkmark.shield")
-                .foregroundStyle(.tint)
-                .accessibilityLabel("Verifying")
-                .help("Quill is verifying this model")
-        case .installed:
-            Image(systemName: "checkmark.circle")
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("Downloaded")
-                .help("This model is downloaded and ready to use")
         case .active:
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
-                .accessibilityLabel("Active model")
-                .help("This model is active")
+            Label("Active model", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.primary)
+        case .installed:
+            Text("Downloaded")
+                .foregroundStyle(.secondary)
+        case .notInstalled:
+            Text("Not downloaded")
+                .foregroundStyle(.secondary)
+        case .downloading:
+            Text("Step 1 of 2 · Download")
+                .foregroundStyle(.secondary)
+        case .verifying:
+            Text("Step 2 of 2 · Verify")
+                .foregroundStyle(.secondary)
         case .failed:
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(.orange)
-                .accessibilityLabel("Model preparation failed")
-                .help("Model preparation failed")
+            Label("Preparation failed", systemImage: "exclamationmark.triangle")
         case .activationFailed:
-            Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(.orange)
-                .accessibilityLabel("Model activation failed")
-                .help("Model activation failed")
+            Label("Activation failed", systemImage: "exclamationmark.triangle")
         }
     }
 
@@ -131,20 +171,35 @@ private struct ModelRow: View {
     private var stateDetail: some View {
         switch state {
         case .downloading(let progress):
-            ProgressView(value: progress) {
-                Text("Downloading…")
-            } currentValueLabel: {
-                Text(progress, format: .percent.precision(.fractionLength(0)))
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Downloading model…")
+                    Spacer()
+                    Text(progress, format: .percent.precision(.fractionLength(0)))
+                        .monospacedDigit()
+                }
+                .font(.callout)
+                ProgressView(value: progress)
+                    .accessibilityLabel("Downloading \(model.displayName)")
             }
-            .accessibilityLabel("Downloading \(model.displayName)")
         case .verifying:
-            ProgressView("Verifying…")
-                .accessibilityLabel("Verifying \(model.displayName)")
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                    .accessibilityLabel("Verifying \(model.displayName)")
+                Text("Checking the model before activation…")
+                    .font(.callout)
+            }
         case .failed(let message), .activationFailed(let message):
-            Text(message)
-                .font(.caption)
-                .foregroundStyle(.red)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .textSelection(.enabled)
+                if case .activationFailed = state {
+                    Text("The model is downloaded. Retry activation without downloading again.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
         default:
             EmptyView()
         }
@@ -158,38 +213,32 @@ private struct ModelRow: View {
                 Task { await manager.downloadAndUse(model) }
             }
             .disabled(actionsDisabled)
+            .accessibilityLabel("Download and use \(model.displayName)")
             .help(actionUnavailableHelp ?? "Download, verify, and use this model")
         case .downloading, .verifying:
-            Button {
-                manager.cancel()
-            } label: {
-                Image(systemName: "xmark.circle")
-            }
-            .buttonStyle(.borderless)
-            .accessibilityLabel("Cancel model download")
-            .help("Cancel download")
+            Button("Cancel") { manager.cancel() }
+                .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Cancel preparation of \(model.displayName)")
+                .help("Cancel model preparation (Esc)")
         case .installed:
-            Button("Use Model") {
-                manager.activate(model)
-            }
-            .disabled(actionsDisabled)
-            .help(actionUnavailableHelp ?? "Use this model for future transcriptions")
+            Button("Use Model") { manager.activate(model) }
+                .disabled(actionsDisabled)
+                .accessibilityLabel("Use \(model.displayName)")
+                .help(actionUnavailableHelp ?? "Use this model for future transcriptions")
         case .active:
-            Text("Active")
-                .foregroundStyle(.secondary)
-                .accessibilityLabel("\(model.displayName) is active")
+            EmptyView()
         case .failed:
-            Button("Retry") {
+            Button("Retry Download") {
                 Task { await manager.downloadAndUse(model) }
             }
             .disabled(actionsDisabled)
+            .accessibilityLabel("Retry downloading \(model.displayName)")
             .help(actionUnavailableHelp ?? "Retry downloading and verifying this model")
         case .activationFailed:
-            Button("Retry Activation") {
-                manager.activate(model)
-            }
-            .disabled(actionsDisabled)
-            .help(actionUnavailableHelp ?? "Retry activating this installed model")
+            Button("Retry Activation") { manager.activate(model) }
+                .disabled(actionsDisabled)
+                .accessibilityLabel("Retry activating \(model.displayName)")
+                .help(actionUnavailableHelp ?? "Retry activating this installed model")
         }
     }
 

@@ -216,9 +216,11 @@ final class AppController {
         }
 
         menuBar.update(indicator: busyState.recordingIndicator, elapsed: "0:00")
-        ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+        ticker = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        // Keep elapsed time current while an NSMenu is tracking input.
+        if let ticker { RunLoop.main.add(ticker, forMode: .common) }
     }
 
     private func stopSession() {
@@ -293,19 +295,20 @@ final class AppController {
             busyState.isTranscribing = true
             modelManager.pendingCount = 0
             menuBar.updateTranscription(
-                queued > 0 ? "transcribing \(name) · \(queued) queued" : "transcribing \(name)"
+                queued > 0 ? "Transcribing \(name) · \(queued) queued" : "Transcribing \(name)"
             )
         case .failed(let name):
             busyState.isTranscribing = false
             modelManager.pendingCount = 0
-            menuBar.updateTranscription("transcription failed · \(name)")
+            menuBar.updateTranscription("Transcription failed · \(name)")
         case .waitingForModel(let pending):
             busyState.isTranscribing = false
             modelManager.pendingCount = pending
             menuBar.updateTranscription(
                 pending == 1
                     ? "1 recording waiting for a model"
-                    : "\(pending) recordings waiting for a model"
+                    : "\(pending) recordings waiting for a model",
+                needsModel: true
             )
         }
         syncBusyState()
