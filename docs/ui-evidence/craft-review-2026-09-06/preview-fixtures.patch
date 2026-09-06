@@ -1,0 +1,56 @@
+--- a/scripts/ui-preview.swift
++++ b/scripts/ui-preview.swift
+@@ -15,8 +15,8 @@
+         let main = NSMenu()
+         let item = NSMenuItem(title: "Preview", action: nil, keyEquivalent: "")
+         let submenu = NSMenu()
+-        for (index, name) in ["Ready", "Setup", "Locked", "Download", "Verifying", "Failure", "Activation failure", "Recording", "Microphone failure"].enumerated() {
+-            let command = NSMenuItem(title: name, action: #selector(selectFixture(_:)), keyEquivalent: String(index + 1))
++        for (index, name) in ["Ready", "Setup", "Locked", "Download", "Verifying", "Failure", "Activation failure", "Recording", "Microphone failure", "Unsaved recording", "Transcription failed", "Transcription off", "Update reserved", "Both installed", "Long failure", "Transcribing"].enumerated() {
++            let command = NSMenuItem(title: name, action: #selector(selectFixture(_:)), keyEquivalent: index < 9 ? String(index + 1) : "")
+             command.target = self
+             submenu.addItem(command)
+         }
+@@ -60,14 +60,17 @@
+         manager?.cancel()
+         fixture = name
+         settings?.close()
+-        let installed = ["Ready", "Locked", "Recording", "Microphone failure"].contains(name)
++        let installed = ["Ready", "Locked", "Recording", "Microphone failure", "Unsaved recording", "Transcription failed", "Transcription off", "Update reserved", "Both installed", "Transcribing"].contains(name)
+         let modelManager = ModelManager(
+             activeModel: .parakeetV3,
+-            actionsLocked: name == "Locked",
++            actionsLocked: ["Locked", "Recording", "Microphone failure", "Update reserved", "Transcribing"].contains(name),
+             pendingCount: name == "Setup" ? 3 : 0,
+             operations: .init(
+-                isInstalled: { model in installed && model == .parakeetV3 },
++                isInstalled: { model in installed && (model == .parakeetV3 || name == "Both installed") },
+                 downloadAndVerify: { _, progress, verifying in
++                    if name == "Long failure" {
++                        throw NSError(domain: "Preview", code: 3, userInfo: [NSLocalizedDescriptionKey: String(repeating: "The model download could not finish because the connection was interrupted. ", count: 12)])
++                    }
+                     if name == "Failure" {
+                         throw NSError(domain: "Preview", code: 1, userInfo: [NSLocalizedDescriptionKey: "The internet connection was interrupted. Check your connection and try again."])
+                     }
+@@ -84,14 +87,19 @@
+             )
+         )
+         manager = modelManager
+-        settings = SettingsWindowController(modelManager: modelManager)
++        settings = SettingsWindowController(modelManager: modelManager, transcriptionEnabled: { name != "Transcription off" })
+         settings?.window?.setFrameAutosaveName("")
+         settings?.window?.setContentSize(NSSize(width: 600, height: 540))
+         settings?.window?.center()
+         settings?.show()
+         menuController?.update(indicator: name == "Microphone failure" ? .microphoneFailed : (name == "Recording" ? .recording : .idle), elapsed: "12:34")
+         menuController?.updateTranscription(name == "Setup" ? "3 recordings waiting for a model" : nil, needsModel: name == "Setup")
+-        if ["Download", "Verifying", "Failure", "Activation failure"].contains(name) {
++        menuController?.updatePendingSave(name == "Unsaved recording" ? "2026-09-06_10-30-00" : nil)
++        menuController?.updateModelPreparation(["Download", "Verifying"].contains(name), recording: ["Recording", "Microphone failure"].contains(name), hasUnsavedRecording: name == "Unsaved recording")
++        menuController?.updateRetryTranscription(enabled: !["Download", "Verifying", "Unsaved recording", "Transcription off", "Update reserved", "Transcribing"].contains(name))
++        if name == "Transcription failed" { menuController?.updateTranscription("Transcription failed · 2026-09-06_10-30-00") }
++        if name == "Transcribing" { menuController?.updateTranscription("Transcribing 2026-09-06_10-30-00 · 2 queued") }
++        if ["Download", "Verifying", "Failure", "Activation failure", "Long failure"].contains(name) {
+             Task { await modelManager.downloadAndUse(.parakeetV3) }
+         }
+     }

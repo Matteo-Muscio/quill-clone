@@ -1,0 +1,9 @@
+Window: "Quill Settings", App: Quill Review.
+0 menu Secondary Actions: Cancel
+	1 (disabled) Microphone unavailable — system audio recording
+	2 Stop recording, ID: toggleClicked
+	3 Retry pending transcriptions, ID: retryTranscriptionClicked
+	4 Open Sound Settings…, ID: openSoundSettingsClicked
+	5 Open recordings folder, ID: openFolderClicked
+	6 Settings…, ID: openSettingsClicked
+	7 Quit quill, ID: quitClicked

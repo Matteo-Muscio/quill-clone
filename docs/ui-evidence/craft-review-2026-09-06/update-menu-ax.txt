@@ -1,0 +1,8 @@
+Window: "Quill Settings", App: Quill Review.
+0 menu Secondary Actions: Cancel
+	1 (disabled) Ready to record
+	2 Start recording, ID: toggleClicked
+	3 (disabled) Retry pending transcriptions, ID: retryTranscriptionClicked
+	4 Open recordings folder, ID: openFolderClicked
+	5 Settings…, ID: openSettingsClicked
+	6 Quit quill, ID: quitClicked
