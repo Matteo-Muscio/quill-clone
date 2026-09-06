@@ -8,7 +8,7 @@ struct Quill: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "quill",
         abstract: "Local meeting recorder + transcriber. Records mic and system audio as two tracks, then transcribes on-device.",
-        subcommands: [Run.self, Doctor.self, Install.self],
+        subcommands: [Run.self, Doctor.self, Install.self, Update.self],
         defaultSubcommand: Run.self
     )
 }
@@ -45,6 +45,7 @@ struct Run: ParsableCommand {
         app.setActivationPolicy(.accessory)
 
         let controller = AppController(root: root)
+        controller.observeUpdateRequests()
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
         sigint.setEventHandler {
@@ -86,6 +87,7 @@ struct AppBusyState {
     var isTranscribing = false
     var isPreparingModel = false
     var hasUnsavedRecording = false
+    var isPreparingUpdate = false
     var micHealth: MicCaptureHealth = .healthy
 
     var recordingIndicator: RecordingIndicator {
@@ -94,15 +96,20 @@ struct AppBusyState {
     }
 
     var modelActionsLocked: Bool {
-        isRecording || isTranscribing
+        isRecording || isTranscribing || isPreparingUpdate
     }
 
     var canStartRecording: Bool {
-        !isPreparingModel && !hasUnsavedRecording
+        !isPreparingModel && !hasUnsavedRecording && !isPreparingUpdate
     }
 
     var canRetryTranscription: Bool {
-        !isPreparingModel && !isTranscribing && !hasUnsavedRecording
+        !isPreparingModel && !isTranscribing && !hasUnsavedRecording && !isPreparingUpdate
+    }
+
+    var canPrepareUpdate: Bool {
+        !isRecording && !isTranscribing && !isPreparingModel
+            && !hasUnsavedRecording && !isPreparingUpdate
     }
 
     mutating func finishRecording(transcriptionEnabled: Bool) {
@@ -127,13 +134,16 @@ final class AppController {
     private var hasNotifiedMicrophoneFailure = false
     private var cancellables: Set<AnyCancellable> = []
     private var statusTask: Task<Void, Never>?
+    private let submittedWork = SubmittedCoordinatorWork()
+    private var updateHandoff: UpdateHandoff?
 
     init(root: URL) {
         self.root = root
         let transcription = TranscriptionCoordinator()
         self.transcription = transcription
-        let modelManager = ModelManager(onActivation: { [transcription, root] in
-            Task { await transcription.modelDidActivate(root: root) }
+        let submittedWork = self.submittedWork
+        let modelManager = ModelManager(onActivation: { [transcription, root, submittedWork] in
+            submittedWork.submit { await transcription.modelDidActivate(root: root) }
         })
         self.modelManager = modelManager
         self.settingsWindow = SettingsWindowController(modelManager: modelManager)
@@ -165,12 +175,38 @@ final class AppController {
             }
             .store(in: &cancellables)
 
-        Task { [transcription, root] in
+        submittedWork.submit { [transcription, root] in
             await transcription.setStatusHandler { status in
                 statusContinuation.yield(status)
             }
             await transcription.resumePending(root: root)
         }
+    }
+
+    func observeUpdateRequests() {
+        guard updateHandoff == nil else { return }
+        updateHandoff = UpdateHandoff(
+            beginReservation: { [weak self] in
+                guard let self, busyState.canPrepareUpdate,
+                      submittedWork.pendingCount == 0 else { return false }
+                busyState.isPreparingUpdate = true
+                syncBusyState()
+                return true
+            },
+            reserveCoordinator: { @MainActor [weak self] in
+                guard let self else { return false }
+                return await self.transcription.reserveForUpdate()
+            },
+            releaseReservation: { [weak self] in
+                self?.busyState.isPreparingUpdate = false
+                self?.syncBusyState()
+            },
+            terminate: { [weak self] in
+                self?.statusTask?.cancel()
+                NSApp.terminate(nil)
+            }
+        )
+        updateHandoff?.startObserving()
     }
 
     /// Stop any live session cleanly (finalizing files) and exit.
@@ -244,7 +280,7 @@ final class AppController {
 
         if saved {
             let dir = session.dir
-            Task { [transcription] in await transcription.enqueue(dir) }
+            submittedWork.submit { [transcription] in await transcription.enqueue(dir) }
         }
     }
 
@@ -275,14 +311,14 @@ final class AppController {
         if saved {
             busyState.finishRecording(transcriptionEnabled: Config.transcriptionEnabled())
             let dir = pendingSave.dir
-            Task { [transcription] in await transcription.enqueue(dir) }
+            submittedWork.submit { [transcription] in await transcription.enqueue(dir) }
         }
         syncBusyState()
     }
 
     private func retryTranscription() {
         guard busyState.canRetryTranscription, Config.transcriptionEnabled() else { return }
-        Task { [transcription, root] in await transcription.resumePending(root: root) }
+        submittedWork.submit { [transcription, root] in await transcription.resumePending(root: root) }
     }
 
     private func showTranscription(_ status: TranscriptionCoordinator.Status) {

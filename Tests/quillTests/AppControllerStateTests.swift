@@ -2,6 +2,25 @@ import XCTest
 @testable import quill
 
 final class AppControllerStateTests: XCTestCase {
+    func testUpdateReservationLocksEveryNewWorkAction() {
+        var state = AppBusyState()
+        XCTAssertTrue(state.canPrepareUpdate)
+        state.isPreparingUpdate = true
+        XCTAssertFalse(state.canStartRecording)
+        XCTAssertFalse(state.canRetryTranscription)
+        XCTAssertTrue(state.modelActionsLocked)
+        XCTAssertFalse(state.canPrepareUpdate)
+    }
+
+    func testUpdateCannotInterruptRecordingSaveModelPreparationOrTranscription() {
+        for keyPath in [\AppBusyState.isRecording, \.hasUnsavedRecording,
+                        \.isPreparingModel, \.isTranscribing] {
+            var state = AppBusyState()
+            state[keyPath: keyPath] = true
+            XCTAssertFalse(state.canPrepareUpdate)
+        }
+    }
+
     func testTranscriptionEndingDoesNotUnlockWhileRecording() {
         var state = AppBusyState()
         state.isRecording = true
