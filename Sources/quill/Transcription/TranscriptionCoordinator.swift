@@ -18,6 +18,7 @@ actor TranscriptionCoordinator {
     private var queue: [URL] = []
     private var inFlight: URL?
     private var draining = false
+    private var reservedForUpdate = false
     private var waitingPendingCount: Int?
     private var engine: TranscriptionEngine?
     private var lastFailure: String?
@@ -27,6 +28,7 @@ actor TranscriptionCoordinator {
     private let isModelInstalled: @Sendable (TranscriptionModel) async throws -> Bool
     private let makeEngine: @Sendable (TranscriptionModel) -> TranscriptionEngine
     private let notification: @Sendable (String, String) -> Void
+    private let onStop: @Sendable () -> String?
 
     init(
         transcriptionEnabled: @escaping @Sendable () -> Bool = {
@@ -43,17 +45,31 @@ actor TranscriptionCoordinator {
         },
         notification: @escaping @Sendable (String, String) -> Void = {
             notifyUser(title: $0, body: $1)
-        }
+        },
+        onStop: @escaping @Sendable () -> String? = { Config.onStop() }
     ) {
         self.transcriptionEnabled = transcriptionEnabled
         self.selectedModel = selectedModel
         self.isModelInstalled = isModelInstalled
         self.makeEngine = makeEngine
         self.notification = notification
+        self.onStop = onStop
     }
 
     func setStatusHandler(_ handler: @escaping @Sendable (Status) -> Void) {
         statusHandler = handler
+    }
+
+    /// Reserve an actually idle coordinator without an actor suspension point.
+    /// Missing-model sessions are durable and recover on restart; active work
+    /// and engine release must finish before the app can exit.
+    func reserveForUpdate() -> Bool {
+        guard !reservedForUpdate, inFlight == nil, !draining,
+              queue.isEmpty || waitingPendingCount != nil else {
+            return false
+        }
+        reservedForUpdate = true
+        return true
     }
 
     /// Queue a finished session. With transcription disabled in config, the
@@ -63,6 +79,8 @@ actor TranscriptionCoordinator {
             runHook(for: sessionDir)
             return
         }
+        // The session is already durable; restart recovery will pick it up.
+        guard !reservedForUpdate else { return }
         if !draining { lastFailure = nil }
         queueIfPending(sessionDir)
         finishQueueUpdate()
@@ -72,7 +90,7 @@ actor TranscriptionCoordinator {
     /// but were never transcribed. Folder names sort chronologically, so
     /// oldest-first is a name sort.
     func resumePending(root: URL) {
-        guard transcriptionEnabled() else { return }
+        guard !reservedForUpdate, transcriptionEnabled() else { return }
         guard let entries = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: nil
         ) else { return }
@@ -273,7 +291,7 @@ actor TranscriptionCoordinator {
     /// as its sole argument, after the transcript exists (or immediately after
     /// recording when transcription is disabled).
     private func runHook(for dir: URL) {
-        guard let cmd = Config.onStop() else { return }
+        guard let cmd = onStop() else { return }
         let task = Process()
         task.launchPath = "/bin/sh"
         task.arguments = ["-c", "\(cmd) \"$0\"", dir.path]

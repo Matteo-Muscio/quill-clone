@@ -21,6 +21,43 @@ quill install --launch-at-login   # optional — runs in the background on login
 virtual device, no kernel extension). Apple Silicon recommended for
 transcription speed.
 
+Source builds and updates also require Git and the Swift toolchain from
+Xcode or its Command Line Tools.
+
+## Update this fork
+
+```sh
+quill update --check          # inspect main without building or restarting
+quill update                 # build, test, and install the latest main
+quill update --wait 60        # allow up to 60 seconds for the app to become idle
+```
+
+This manual updater uses `Matteo-Muscio/quill-clone` only. It builds in a
+separate cache, runs debug and release tests, checks the executable signature
+and CLI, then asks Quill to exit when idle. Recording, transcription, model
+preparation, and unsaved recording metadata block the handoff. The default
+idle timeout is five minutes; a timeout leaves the running app untouched.
+`--wait 0` installs only if the daemon is already stopped.
+
+The existing LaunchAgent must point to a user-owned, writable `quill` binary.
+The updater never uses sudo; a root-owned installation made with the commands
+above needs a one-time migration to a user-owned location before using it.
+For an existing user-local installation, invoke its full path if it is not on
+your PATH, for example `"$HOME/Library/Application Support/quill/bin/quill" update`.
+For the first update from a version without this
+handoff, finish active work and quit Quill from its menu before updating.
+Later updates handle that step automatically. A failed restart attempts to
+restore the previous executable; if safe rollback cannot finish, the command
+reports the retained backup and recovery error.
+
+Source, build output, `update.log`, and the installed revision receipt live in
+`~/Library/Application Support/quill/updates/`. Each attempted installation
+retains a backup under `updates/backups/`, including the previous binary and
+LaunchAgent plist. The updater preserves settings and the existing plist and
+does not modify your development checkout. It makes no scheduled checks and
+needs no paid signing service. `--check` reports “up to date” only when both
+the recorded main revision and the installed binary hash match.
+
 ## How to use
 
 1. **Run it** (`quill` in a terminal, or the LaunchAgent).
@@ -143,6 +180,8 @@ quill run --out <dir>        # custom recordings root (default ~/Recordings)
 quill doctor                 # check permissions, recordings folder, models
 quill install --launch-at-login
 quill install --uninstall
+quill update --check
+quill update
 ```
 
 ## Stack

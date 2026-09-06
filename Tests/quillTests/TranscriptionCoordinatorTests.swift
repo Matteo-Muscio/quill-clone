@@ -3,6 +3,108 @@ import XCTest
 @testable import quill
 
 final class TranscriptionCoordinatorTests: XCTestCase {
+    func testDisabledTranscriptionStillLaunchesStopHookAfterReservation() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("pending", in: root)
+        let marker = session.appendingPathComponent("hook-ran")
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { false }, notification: { _, _ in },
+            onStop: { #"printf complete > "$0/hook-ran"; :"# }
+        )
+        let reserved = await coordinator.reserveForUpdate()
+        XCTAssertTrue(reserved)
+        await coordinator.enqueue(session)
+        await waitUntil { FileManager.default.fileExists(atPath: marker.path) }
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "complete")
+    }
+
+    func testUpdateReservationAllowsDurableMissingModelQueueAndRestartRecoversIt() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("pending", in: root)
+        let statuses = Locked<[String]>([])
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, isModelInstalled: { _ in false },
+            notification: { _, _ in }
+        )
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        await waitUntil { statuses.value.contains("waiting:1") }
+        let reserved = await coordinator.reserveForUpdate()
+        XCTAssertTrue(reserved)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: session.appendingPathComponent("meta.json").path
+        ))
+        let nextLaunch = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, isModelInstalled: { _ in true },
+            makeEngine: { _ in TestEngine() }, notification: { _, _ in }
+        )
+        await nextLaunch.resumePending(root: root)
+        await waitUntil {
+            FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.json").path)
+        }
+    }
+
+    func testUpdateReservationRejectsInFlightWorkAndEngineRelease() async throws {
+        let root = try temporaryRoot()
+        _ = try makeSession("pending", in: root)
+        let transcribeGate = TestGate()
+        let releaseGate = TestGate()
+        let engine = TestEngine(transcribeGate: transcribeGate, releaseGate: releaseGate)
+        let statuses = Locked<[String]>([])
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, isModelInstalled: { _ in true },
+            makeEngine: { _ in engine }, notification: { _, _ in }
+        )
+        await coordinator.setStatusHandler { status in
+            statuses.update { $0.append(Self.label(for: status)) }
+        }
+        await coordinator.resumePending(root: root)
+        await transcribeGate.waitUntilEntered()
+        let duringTranscription = await coordinator.reserveForUpdate()
+        XCTAssertFalse(duringTranscription)
+        await transcribeGate.open()
+        await releaseGate.waitUntilEntered()
+        let duringRelease = await coordinator.reserveForUpdate()
+        XCTAssertFalse(duringRelease)
+        await releaseGate.open()
+        await waitUntil { statuses.value.last == "idle" }
+        let afterRelease = await coordinator.reserveForUpdate()
+        XCTAssertTrue(afterRelease)
+    }
+
+    func testReservedCoordinatorDefersNewWorkToRestartWithoutDeletingIt() async throws {
+        let root = try temporaryRoot()
+        let session = try makeSession("pending", in: root)
+        let engine = TestEngine()
+        let coordinator = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, isModelInstalled: { _ in true },
+            makeEngine: { _ in engine }, notification: { _, _ in }
+        )
+        let reserved = await coordinator.reserveForUpdate()
+        XCTAssertTrue(reserved)
+        let duplicate = await coordinator.reserveForUpdate()
+        XCTAssertFalse(duplicate)
+        await coordinator.enqueue(session)
+        await coordinator.resumePending(root: root)
+        await coordinator.modelDidActivate(root: root)
+        for _ in 0..<20 { await Task.yield() }
+        let count = await engine.transcribeCount
+        XCTAssertEqual(count, 0)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: session.appendingPathComponent("meta.json").path
+        ))
+        let nextLaunch = TranscriptionCoordinator(
+            transcriptionEnabled: { true }, isModelInstalled: { _ in true },
+            makeEngine: { _ in engine }, notification: { _, _ in }
+        )
+        await nextLaunch.resumePending(root: root)
+        await waitUntil {
+            FileManager.default.fileExists(atPath: session.appendingPathComponent("transcript.json").path)
+        }
+    }
+
     func testMissingModelRetainsQueueAndPublishesWaitingOnce() async throws {
         let root = try temporaryRoot()
         let session = try makeSession("2026-07-30-100000", in: root)
