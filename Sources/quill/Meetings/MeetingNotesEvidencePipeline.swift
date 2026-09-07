@@ -7,7 +7,7 @@ import Foundation
 struct MeetingNotesEvidencePipeline: Sendable {
     struct Runner: Sendable {
         var countTokens: @Sendable (String) async throws -> Int
-        var complete: @Sendable (_ prompt: String, _ schema: String) async throws -> Data
+        var complete: @Sendable (_ prompt: String, _ schema: String, _ stage: NotesGenerationStage) async throws -> Data
         var trace: @Sendable (_ stage: String, _ output: Data) -> Void = { _, _ in }
     }
 
@@ -70,7 +70,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
             try Task.checkCancellation()
             progress(.init(fraction: 0.08 + 0.55 * Double(index) / Double(batches.count),
                            message: batches.count == 1 ? "Finding evidence in the transcript" : "Finding evidence in section \(index + 1) of \(batches.count)"))
-            let output = try await runner.complete(extractionPrompt(batch), Self.extractionSchema)
+            let output = try await runner.complete(extractionPrompt(batch), Self.extractionSchema, .extraction)
             runner.trace("extraction-\(index + 1)", output)
             try Task.checkCancellation()
             let extraction: Extraction = try Self.decode(output)
@@ -91,7 +91,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
             let groups = try await fitting(pending, prompt: renderingPrompt)
             progress(.init(fraction: min(0.94, 0.68 + Double(pass) * 0.02), message: "Writing notes from cited evidence"))
             if groups.count == 1 {
-                let output = try await runner.complete(renderingPrompt(pending), Self.renderingSchema)
+                let output = try await runner.complete(renderingPrompt(pending), Self.renderingSchema, .rendering)
                 runner.trace("rendering-\(pass + 1)-1", output)
                 try Task.checkCancellation()
                 let raw: Rendering = try Self.decode(output)
@@ -105,7 +105,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
             var selected = Set<String>()
             for (index, group) in selectionGroups.enumerated() {
                 try Task.checkCancellation()
-                let output = try await runner.complete(selectionPrompt(group), Self.selectionSchema(facts: group))
+                let output = try await runner.complete(selectionPrompt(group), Self.selectionSchema(facts: group), .selection)
                 runner.trace("selection-\(pass + 1)-\(index + 1)", output)
                 try Task.checkCancellation()
                 let selection: Selection = try Self.decode(output)
@@ -120,7 +120,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
 
     /// Prefer complete records and count the actual model template. A source
     /// larger than the context may be sliced; validated facts remain indivisible.
-    private func fitting<T: Sendable>(_ items: [T], prompt: ([T]) throws -> String,
+    func fitting<T: Sendable>(_ items: [T], prompt: ([T]) throws -> String,
                                      splitSingle: ((T) -> [T])? = nil) async throws -> [[T]] {
         var pending = [items], result: [[T]] = []
         while !pending.isEmpty {
@@ -279,7 +279,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
         return facts.filter { seenText.insert(normalized($0.text)).inserted }
     }
 
-    static func validate(_ draft: Rendering, facts: [Fact]) throws -> Rendering {
+    static func validate(_ draft: Rendering, facts: [Fact], normalizer: ((String) -> String)? = nil) throws -> Rendering {
         guard !draft.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, draft.title.count <= 200,
               draft.summary.count <= 3, draft.keyTakeaways.count <= 6, draft.actionItems.count <= 6 else {
             throw MeetingNotesError.invalidOutput
@@ -295,7 +295,7 @@ struct MeetingNotesEvidencePipeline: Sendable {
         }
         func accepted(_ claims: [Claim], action: Bool, seen: inout Set<String>) -> [Claim] {
             claims.compactMap { claim in
-                let textKey = "text:" + normalized(claim.text)
+                let textKey = "text:" + (normalizer?(claim.text) ?? normalized(claim.text))
                 guard valid(claim, action: action), seen.insert(textKey).inserted else { return nil }
                 return Claim(text: claim.text.trimmingCharacters(in: .whitespacesAndNewlines), factIDs: orderedUnique(claim.factIDs))
             }

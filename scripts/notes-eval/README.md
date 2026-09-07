@@ -57,3 +57,66 @@ to measure the complete transcription-to-notes flow, and create the reported
 output directory's `stop` file after generation finishes. The app releases the
 transcription engine before generating notes. Neither
 measurement is a performance verification on a MacBook Air or a 16 GiB Mac.
+
+## Generation and pipeline experiments
+
+The native `notes` command accepts an optional final options-file argument:
+
+```sh
+QuillMeetingPreview notes transcript.txt qwen3.5-4b-q4_k_m \
+  verifiedEvidence notes.json options.json
+```
+
+`singlePass` and `evidenceFirst` remain available as controls. `verifiedEvidence`
+adds atomic extraction with literal source spans and unknown fields, adjacent
+context, and separate checks of extracted facts and final claims. Model verdicts
+are fallible judgments; citation validation does not prove that a claim is true.
+The experiment can retain a useful qualified takeaway while leaving unclear
+owners, dates, quantities, or terminology unresolved.
+
+Options are internal developer inputs, not saved app preferences. Omitted fields
+retain their defaults. For example:
+
+```json
+{
+  "seed": 42,
+  "contextTokens": 8192,
+  "outputTokens": 2200,
+  "defaultCompletion": {"temperature": 0.4, "topP": 0.8, "topK": 20},
+  "stageOverrides": {
+    "extraction": {"thinkingBudget": 512},
+    "rendering": {"temperature": 0.2}
+  },
+  "verification": {
+    "atomicExtraction": true,
+    "verifyFacts": true,
+    "verifyClaims": true,
+    "includeContext": true
+  }
+}
+```
+
+This is an example experiment, not an accuracy recommendation. Stage names are
+`extraction`, `verification`, `selection`, `rendering`, and `direct`. Optional
+sampling/seed fields inherit from `defaultCompletion`; an explicit stage entry
+has `thinkingBudget: 0` unless supplied, so a rendering override can turn thinking
+off. Supported thinking budgets are 0, 512 and 2048, with thinking currently limited
+to Qwen3.5 4B. Invalid settings or insufficient context are rejected.
+
+The pinned raw completion path does not activate the backend reasoning-budget
+sampler merely by supplying its flag. Quill instead bounds an initial thinking
+continuation by its generation-token limit and closing marker, then replays it
+inside a closed thinking block for a separate schema-constrained JSON completion.
+The first pass may reach its limit mid-sentence. Context packing reserves both
+thinking and final output, and the actual replay is counted again. Both worker
+startups and replay cost count toward elapsed time. Reasoning is not returned in
+notes or retained by the evaluation trace callback.
+
+Pass the same file to the serial runner with `--options /absolute/path/options.json`.
+Its result records requested options and their file hash; native metrics record
+the decoded generation options. Use a fresh output directory for every condition
+and seed. Keep the transcript fixed while testing prompts, sampling or thinking;
+report failures, omissions and unsupported claims, not just fluent output or
+valid JSON. Hold out unseen cases and repeat finalist configurations across seeds
+before choosing application defaults. A frontier-model output is a comparison
+specimen, not a reference transcript or a guaranteed upper bound.

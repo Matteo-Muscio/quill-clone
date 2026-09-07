@@ -1,6 +1,7 @@
 // Developer verification harness. Audio and output stay in the isolated root.
 // Usage: QuillMeetingPreview [analyze AUDIO_PATH PARTICIPANTS]
 //        QuillMeetingPreview transcribe AUDIO MODEL_ID current|multilingual OUTPUT_JSON
+//        QuillMeetingPreview notes TRANSCRIPT MODEL_ID STRATEGY OUTPUT_JSON [OPTIONS_JSON]
 // QUILL_MEETING_TEST_ROOT selects the persistent test root.
 import AppKit
 import AVFoundation
@@ -17,6 +18,7 @@ struct MeetingPreviewEntry {
             ?? Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("recordings").path)
         let arguments = Array(CommandLine.arguments.dropFirst())
         if arguments.first == "transcribe" {
+            umask(0o077)
             guard arguments.count == 5 else {
                 FileHandle.standardError.write(Data("Usage: transcribe AUDIO MODEL_ID current|multilingual OUTPUT_JSON\n".utf8))
                 exit(2)
@@ -40,7 +42,12 @@ struct MeetingPreviewEntry {
             }
             dispatchMain()
         }
-        if arguments.first == "notes", arguments.count == 5 {
+        if arguments.first == "notes" {
+            umask(0o077)
+            guard [5, 6].contains(arguments.count) else {
+                FileHandle.standardError.write(Data("Usage: notes TRANSCRIPT MODEL_ID STRATEGY OUTPUT_JSON [OPTIONS_JSON]\n".utf8))
+                exit(2)
+            }
             Task.detached {
                 do {
                     guard let model = NotesModel(rawValue: arguments[2]),
@@ -48,11 +55,14 @@ struct MeetingPreviewEntry {
                         throw NSError(domain: "MeetingPreview", code: 2,
                                       userInfo: [NSLocalizedDescriptionKey: "Unknown notes model or strategy"])
                     }
+                    let options = try arguments.count == 6
+                        ? JSONDecoder().decode(NotesGenerationOptions.self, from: Data(contentsOf: URL(fileURLWithPath: arguments[5])))
+                        : .defaults
                     try await generateNotes(source: URL(fileURLWithPath: arguments[1]), model: model,
-                                            strategy: strategy, output: URL(fileURLWithPath: arguments[4]))
+                                            strategy: strategy, output: URL(fileURLWithPath: arguments[4]), options: options)
                     exit(0)
                 } catch {
-                    FileHandle.standardError.write(Data("Notes verification failed: \(error.localizedDescription)\n".utf8))
+                    FileHandle.standardError.write(Data("Notes verification failed (\((error as NSError).domain), code \((error as NSError).code)).\n".utf8))
                     exit(1)
                 }
             }
@@ -228,6 +238,8 @@ struct MeetingPreviewEntry {
                             words: words, transcript: words.map(\.text).joined(separator: " "))
         try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                             ofItemAtPath: output.deletingLastPathComponent().path)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         // Exclusive creation also catches an output created after the early check.
@@ -246,25 +258,38 @@ struct MeetingPreviewEntry {
     /// Bounded evaluation uses the same engine as the UI. Gold checklists never
     /// enter the prompt; the harness reads only an explicitly supplied transcript.
     static func generateNotes(source: URL, model: NotesModel, strategy: MeetingNotesEngine.Strategy,
-                              output: URL) async throws {
+                              output: URL, options: NotesGenerationOptions = .defaults) async throws {
+        guard !FileManager.default.fileExists(atPath: output.path) else {
+            throw NSError(domain: "MeetingPreviewOutputExists", code: 17)
+        }
         let transcript = try String(contentsOf: source, encoding: .utf8)
         let started = Date()
-        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700],
+                                             ofItemAtPath: output.deletingLastPathComponent().path)
         var notes = try await MeetingNotesEngine.shared.generate(transcript: transcript, model: model, strategy: strategy,
+            options: options,
             trace: { stage, data in
-                try? data.write(to: output.deletingLastPathComponent().appendingPathComponent("trace-\(stage)-\(UUID().uuidString).txt"), options: .atomic)
+                let trace = output.deletingLastPathComponent().appendingPathComponent("trace-\(stage)-\(UUID().uuidString).txt")
+                try? data.write(to: trace, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: trace.path)
             })
         let elapsed = Date().timeIntervalSince(started)
         notes.sourceTranscriptHash = SHA256.hash(data: Data(transcript.utf8)).map { String(format: "%02x", $0) }.joined()
         try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try encoder.encode(notes).write(to: output, options: .atomic)
+        try encoder.encode(notes).write(to: output, options: .withoutOverwriting)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
         let metrics: [String: Any] = ["model": model.rawValue, "strategy": strategy.rawValue,
+                                     "generationOptions": try JSONSerialization.jsonObject(with: encoder.encode(options)),
                                      "elapsedSeconds": elapsed, "sourceSHA256": notes.sourceTranscriptHash ?? "",
                                      "outputLanguage": MeetingNotesEngine.languageName(in: notes.title + "\n" + notes.summary) ?? "undetermined"]
         let data = try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: output.appendingPathExtension("metrics.json"), options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600],
+                                             ofItemAtPath: output.appendingPathExtension("metrics.json").path)
         print("\(model.rawValue) · \(strategy.rawValue) · \(String(format: "%.2f", elapsed)) seconds · saved \(output.path)")
     }
 }

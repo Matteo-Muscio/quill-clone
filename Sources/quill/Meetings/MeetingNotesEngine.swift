@@ -12,6 +12,7 @@ enum MeetingNotesError: Error, LocalizedError {
     case emptyTranscript
     case transcriptTooLarge
     case couldNotCompact
+    case invalidGenerationOptions
 
     var errorDescription: String? {
         switch self {
@@ -25,6 +26,7 @@ enum MeetingNotesError: Error, LocalizedError {
         case .emptyTranscript: "Transcribe this recording before generating meeting notes."
         case .transcriptTooLarge: "This transcript is too large for one notes job. Split it into shorter meetings."
         case .couldNotCompact: "The notes could not be combined within the local context limit. Your transcript is unchanged."
+        case .invalidGenerationOptions: "The experimental notes settings are unsupported or leave too little context for the prompt."
         }
     }
 }
@@ -34,15 +36,15 @@ enum MeetingNotesError: Error, LocalizedError {
 /// temporary worker output are removed when the job ends, including cancellation.
 actor MeetingNotesEngine {
     static let shared = MeetingNotesEngine()
-    enum Strategy: String, Sendable { case singlePass, evidenceFirst }
+    enum Strategy: String, Sendable { case singlePass, evidenceFirst, verifiedEvidence }
     /// Local output checks favored evidence retrieval for 4B. Smaller models
     /// lost accuracy in the extra extraction stage, so keep their direct path.
     nonisolated static func defaultStrategy(for model: NotesModel) -> Strategy {
         model == .qwen35_4B ? .evidenceFirst : .singlePass
     }
-    static let contextTokens = 8192
-    static let outputTokens = 2200
-    static let maximumPromptTokens = contextTokens - outputTokens - 200
+    static let contextTokens = NotesGenerationOptions.defaults.contextTokens
+    static let outputTokens = NotesGenerationOptions.defaults.outputTokens
+    static let maximumPromptTokens = NotesGenerationOptions.defaults.maximumPromptTokens
     private let store: NotesArtifactStore
     private let root: URL
     private var running = false
@@ -53,11 +55,13 @@ actor MeetingNotesEngine {
     }
 
     func generate(transcript: String, model: NotesModel, strategy: Strategy? = nil,
+                  options: NotesGenerationOptions = .defaults,
                   trace: @escaping @Sendable (String, Data) -> Void = { _, _ in },
                   progress: @escaping @Sendable (MeetingAnalysisProgress) -> Void = { _ in }) async throws -> MeetingNotes {
         guard !running else { throw MeetingNotesError.busy }
         guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw MeetingNotesError.emptyTranscript }
         guard transcript.utf8.count <= 1_000_000 else { throw MeetingNotesError.transcriptTooLarge }
+        try options.validate(for: model)
         running = true
         defer { running = false }
         try Task.checkCancellation()
@@ -69,34 +73,40 @@ actor MeetingNotesEngine {
         try FileManager.default.createDirectory(at: working, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: working) }
-        if (strategy ?? Self.defaultStrategy(for: model)) == .evidenceFirst {
+        let strategy = strategy ?? Self.defaultStrategy(for: model)
+        if strategy == .evidenceFirst || strategy == .verifiedEvidence {
             let runner = MeetingNotesEvidencePipeline.Runner(
                 countTokens: { [self] prompt in
                     try await tokenCount(prompt, installation: installation, working: working)
                 },
-                complete: { [self] prompt, schema in
-                    try await runCompletion(prompt: prompt, schema: schema, model: model,
+                complete: { [self] prompt, schema, stage in
+                    try await runCompletion(prompt: prompt, schema: schema, model: model, options: options, stage: stage,
                                             installation: installation, working: working)
                 }, trace: trace)
-            let notes = try await MeetingNotesEvidencePipeline(model: model, language: language, runner: runner)
-                .generate(transcript: transcript, progress: progress)
+            let notes: MeetingNotes
+            if strategy == .verifiedEvidence {
+                notes = try await MeetingNotesVerifiedPipeline(model: model, language: language, runner: runner,
+                    maximumPromptTokens: options.maximumPromptTokens, options: options.verification)
+                    .generate(transcript: transcript, progress: progress)
+            } else {
+                notes = try await MeetingNotesEvidencePipeline(model: model, language: language, runner: runner,
+                    maximumPromptTokens: options.maximumPromptTokens)
+                    .generate(transcript: transcript, progress: progress)
+            }
             try Task.checkCancellation()
             progress(.init(fraction: 1, message: "Meeting notes ready · review before sharing"))
             return notes
         }
-        let schemaURL = working.appendingPathComponent("notes-schema.json")
-        try Self.schema.write(to: schemaURL, atomically: true, encoding: .utf8)
-
         progress(.init(fraction: 0.02, message: "Preparing local meeting notes"))
         let pieces = try await fittingPieces(transcript, model: model, kind: .transcript, language: language,
-                                             installation: installation, working: working)
+                                             options: options, installation: installation, working: working)
         var drafts: [Draft] = []
         for (index, piece) in pieces.enumerated() {
             try Task.checkCancellation()
             progress(.init(fraction: 0.08 + 0.65 * Double(index) / Double(pieces.count),
                            message: pieces.count == 1 ? "Writing notes on this Mac" : "Reading section \(index + 1) of \(pieces.count)"))
             drafts.append(try await complete(piece, model: model, kind: .transcript, language: language,
-                                              installation: installation, working: working, schemaURL: schemaURL))
+                                              options: options, installation: installation, working: working))
         }
         var pass = 0
         while drafts.count > 1 {
@@ -109,12 +119,12 @@ actor MeetingNotesEngine {
                 return "Section \(index + 1):\n" + String(decoding: data, as: UTF8.self)
             }.joined(separator: "\n\n")
             let combined = try await fittingPieces(sources, model: model, kind: .drafts, language: language,
-                                                   installation: installation, working: working)
+                                                   options: options, installation: installation, working: working)
             guard combined.count < drafts.count else { throw MeetingNotesError.couldNotCompact }
             var next: [Draft] = []
             for piece in combined {
                 next.append(try await complete(piece, model: model, kind: .drafts, language: language,
-                                                installation: installation, working: working, schemaURL: schemaURL))
+                                                options: options, installation: installation, working: working))
             }
             drafts = next
         }
@@ -126,6 +136,7 @@ actor MeetingNotesEngine {
     }
 
     private func fittingPieces(_ text: String, model: NotesModel, kind: SourceKind, language: String?,
+                               options: NotesGenerationOptions,
                                installation: NotesArtifactStore.Installation, working: URL) async throws -> [String] {
         var pending = Self.chunks(text, maximumBytes: 24_000)
         var fitting: [String] = []
@@ -134,7 +145,7 @@ actor MeetingNotesEngine {
             guard fitting.count + pending.count <= 128 else { throw MeetingNotesError.transcriptTooLarge }
             let next = pending.removeFirst()
             let prompt = Self.prompt(source: next, model: model, kind: kind, language: language)
-            if try await tokenCount(prompt, installation: installation, working: working) <= Self.maximumPromptTokens {
+            if try await tokenCount(prompt, installation: installation, working: working) <= options.maximumPromptTokens {
                 fitting.append(next)
             }
             else {
@@ -147,16 +158,11 @@ actor MeetingNotesEngine {
     }
 
     private func complete(_ source: String, model: NotesModel, kind: SourceKind, language: String?,
-                          installation: NotesArtifactStore.Installation, working: URL, schemaURL: URL) async throws -> Draft {
-        try Task.checkCancellation()
-        let promptURL = working.appendingPathComponent("prompt.txt")
-        try Self.prompt(source: source, model: model, kind: kind, language: language).write(to: promptURL, atomically: true, encoding: .utf8)
-        let output = try await NotesLocalProcess().run(executable: installation.completionURL,
-            arguments: Self.arguments(modelURL: installation.modelURL, promptURL: promptURL, schemaURL: schemaURL, model: model),
-            directory: working)
-        try Task.checkCancellation()
-        guard output.status == 0 else { throw MeetingNotesError.workerFailed(output.status) }
-        return try Self.decode(output.data)
+                          options: NotesGenerationOptions,
+                          installation: NotesArtifactStore.Installation, working: URL) async throws -> Draft {
+        let output = try await runCompletion(prompt: Self.prompt(source: source, model: model, kind: kind, language: language),
+            schema: Self.schema, model: model, options: options, stage: .direct, installation: installation, working: working)
+        return try Self.decode(output)
     }
 
     private func tokenCount(_ prompt: String, installation: NotesArtifactStore.Installation, working: URL) async throws -> Int {
@@ -172,26 +178,61 @@ actor MeetingNotesEngine {
     }
 
     private func runCompletion(prompt: String, schema: String, model: NotesModel,
+                               options: NotesGenerationOptions, stage: NotesGenerationStage,
                                installation: NotesArtifactStore.Installation, working: URL) async throws -> Data {
         try Task.checkCancellation()
         let promptURL = working.appendingPathComponent("prompt.txt")
         let schemaURL = working.appendingPathComponent("notes-schema.json")
-        try prompt.write(to: promptURL, atomically: true, encoding: .utf8)
+        var finalPrompt = prompt
+        let completion = options.options(for: stage)
+        if completion.thinkingBudget > 0 {
+            let thinkingPrompt = try NotesPromptFormat.thinkingPrompt(from: prompt, model: model)
+            try thinkingPrompt.write(to: promptURL, atomically: true, encoding: .utf8)
+            // b10837 raw completion does not initialize reasoning sampler markers.
+            // Bound a separate ungrammatical continuation with --predict, then
+            // replay it under a closed thinking block for schema-constrained JSON.
+            // Both worker startup and replay cost belong to the experiment latency.
+            let reasoning = try await NotesLocalProcess().run(executable: installation.completionURL,
+                arguments: Self.arguments(modelURL: installation.modelURL, promptURL: promptURL,
+                    schemaURL: schemaURL, model: model, options: options, stage: stage, thinkingPass: true),
+                directory: working)
+            try Task.checkCancellation()
+            guard reasoning.status == 0 else { throw MeetingNotesError.workerFailed(reasoning.status) }
+            finalPrompt = NotesPromptFormat.finalPrompt(thinkingPrompt: thinkingPrompt, reasoning: reasoning.data)
+            // Retokenization and escaping can change token counts. Fail closed if
+            // this actual replay cannot leave the complete final-output budget.
+            guard try await tokenCount(finalPrompt, installation: installation, working: working)
+                    <= options.contextTokens - options.outputTokens - 200 else {
+                throw MeetingNotesError.transcriptTooLarge
+            }
+            // No reasoning is sent to trace callbacks. Worker stdout/stderr are
+            // removed on exit; the replay prompt is removed with the private job.
+        }
+        try finalPrompt.write(to: promptURL, atomically: true, encoding: .utf8)
         try schema.write(to: schemaURL, atomically: true, encoding: .utf8)
         let output = try await NotesLocalProcess().run(executable: installation.completionURL,
-            arguments: Self.arguments(modelURL: installation.modelURL, promptURL: promptURL, schemaURL: schemaURL, model: model),
+            arguments: Self.arguments(modelURL: installation.modelURL, promptURL: promptURL, schemaURL: schemaURL,
+                                      model: model, options: options, stage: stage),
             directory: working)
         try Task.checkCancellation()
         guard output.status == 0 else { throw MeetingNotesError.workerFailed(output.status) }
         return output.data
     }
 
-    nonisolated static func arguments(modelURL: URL, promptURL: URL, schemaURL: URL, model: NotesModel = .qwen35_2B) -> [String] {
-        ["-m", modelURL.path, "-f", promptURL.path,
-         "--ctx-size", String(contextTokens), "--predict", String(outputTokens),
+    nonisolated static func arguments(modelURL: URL, promptURL: URL, schemaURL: URL, model: NotesModel = .qwen35_2B,
+                                     options: NotesGenerationOptions = .defaults, stage: NotesGenerationStage = .direct,
+                                     thinkingPass: Bool = false) -> [String] {
+        let completion = options.options(for: stage)
+        let format = thinkingPass
+            ? ["--reverse-prompt", "</think>", "--special"]
+            : ["--json-schema-file", schemaURL.path]
+        return ["-m", modelURL.path, "-f", promptURL.path,
+         "--ctx-size", String(options.contextTokens),
+         "--predict", String(thinkingPass ? completion.thinkingBudget : options.outputTokens),
          "--threads", "4", "--batch-size", "512", "--ubatch-size", "128", "--gpu-layers", "all",
-         "--seed", "42", "--no-conversation", "--no-display-prompt", "--no-escape",
-         "--no-context-shift", "--no-warmup", "--simple-io", "--offline", "--json-schema-file", schemaURL.path] + NotesPromptFormat.samplingArguments(for: model)
+         "--seed", String(completion.seed ?? options.seed), "--no-conversation", "--no-display-prompt", "--no-escape",
+         "--no-context-shift", "--no-warmup", "--simple-io", "--offline"]
+            + format + NotesPromptFormat.samplingArguments(for: model, options: completion)
     }
 
     enum SourceKind: Sendable { case transcript, drafts }
