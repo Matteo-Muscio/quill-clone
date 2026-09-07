@@ -86,6 +86,7 @@ struct AppBusyState {
     var isRecording = false
     var isTranscribing = false
     var isPreparingModel = false
+    var isPreparingNotesModel = false
     var hasUnsavedRecording = false
     var isPreparingUpdate = false
     var isProcessingMeeting = false
@@ -97,20 +98,20 @@ struct AppBusyState {
     }
 
     var modelActionsLocked: Bool {
-        isRecording || isTranscribing || isPreparingUpdate || isProcessingMeeting
+        isRecording || isTranscribing || isPreparingUpdate || isProcessingMeeting || isPreparingNotesModel
     }
 
     var canStartRecording: Bool {
-        !isPreparingModel && !hasUnsavedRecording && !isPreparingUpdate && !isProcessingMeeting
+        !isPreparingModel && !isPreparingNotesModel && !hasUnsavedRecording && !isPreparingUpdate && !isProcessingMeeting
     }
 
     var canRetryTranscription: Bool {
-        !isPreparingModel && !isTranscribing && !hasUnsavedRecording && !isPreparingUpdate
+        !isPreparingModel && !isPreparingNotesModel && !isTranscribing && !hasUnsavedRecording && !isPreparingUpdate
             && !isProcessingMeeting
     }
 
     var canPrepareUpdate: Bool {
-        !isRecording && !isTranscribing && !isPreparingModel
+        !isRecording && !isTranscribing && !isPreparingModel && !isPreparingNotesModel
             && !hasUnsavedRecording && !isPreparingUpdate && !isProcessingMeeting
     }
 
@@ -128,6 +129,7 @@ final class AppController {
     private let menuBar = MenuBarController()
     private let transcription: TranscriptionCoordinator
     private let modelManager: ModelManager
+    private let notesManager: NotesModelManager
     private let settingsWindow: SettingsWindowController
     private var session: RecordingSession?
     private var pendingSave: RecordingSession?
@@ -149,7 +151,9 @@ final class AppController {
             submittedWork.submit { await transcription.modelDidActivate(root: root) }
         })
         self.modelManager = modelManager
-        self.settingsWindow = SettingsWindowController(modelManager: modelManager)
+        let notesManager = NotesModelManager.shared
+        self.notesManager = notesManager
+        self.settingsWindow = SettingsWindowController(modelManager: modelManager, notesManager: notesManager)
 
         let (statuses, statusContinuation) =
             AsyncStream<TranscriptionCoordinator.Status>.makeStream()
@@ -174,6 +178,15 @@ final class AppController {
             .sink { [weak self] (isPreparing: Bool) in
                 MainActor.assumeIsolated {
                     self?.busyState.isPreparingModel = isPreparing
+                    self?.syncBusyState()
+                }
+            }
+            .store(in: &cancellables)
+
+        notesManager.$isPreparingModel
+            .sink { [weak self] isPreparing in
+                MainActor.assumeIsolated {
+                    self?.busyState.isPreparingNotesModel = isPreparing
                     self?.syncBusyState()
                 }
             }
@@ -367,8 +380,10 @@ final class AppController {
         // coordinator; no import/save can race the final cooperative exit.
         meetingWindow?.model.isExternallyLocked = busyState.isPreparingUpdate
         modelManager.actionsLocked = busyState.modelActionsLocked
+        notesManager.actionsLocked = busyState.isRecording || busyState.isTranscribing
+            || busyState.isPreparingModel || busyState.isPreparingUpdate || busyState.isProcessingMeeting
         menuBar.updateModelPreparation(
-            busyState.isPreparingModel || busyState.isProcessingMeeting,
+            busyState.isPreparingModel || busyState.isPreparingNotesModel || busyState.isProcessingMeeting,
             recording: busyState.isRecording,
             hasUnsavedRecording: busyState.hasUnsavedRecording
         )
@@ -432,6 +447,15 @@ final class AppController {
                     self?.syncBusyState()
                 }
             )
+            meetingWindow?.model.noteGenerator = { [weak self] document, progress in
+                guard let self else { throw CancellationError() }
+                return try await MeetingNotesEngine.shared.generate(
+                    transcript: document.transcriptMarkdown,
+                    model: self.notesManager.activeModel,
+                    progress: progress
+                )
+            }
+            meetingWindow?.model.onOpenNotesSettings = { [weak self] in self?.settingsWindow.show() }
         }
         meetingWindow?.show()
     }

@@ -3,6 +3,9 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+typealias MeetingNoteGenerator = (MeetingDocument, @escaping @Sendable (MeetingAnalysisProgress) -> Void) async throws -> MeetingNotes
+typealias MeetingTranscriber = @Sendable (URL, Int, TranscriptionModel, @escaping @Sendable (MeetingAnalysisProgress) -> Void) async throws -> MeetingAnalysisResult
+
 @MainActor
 final class MeetingEditorModel: ObservableObject {
     @Published var document: MeetingDocument?
@@ -16,13 +19,16 @@ final class MeetingEditorModel: ObservableObject {
     @Published var progress = 0.0
     @Published var status = "Drop a recording to begin"
     @Published var error: String?
-    @Published var participantCount = 2
+    @Published var participantCount = 0
     @Published private(set) var undoCount = 0
     @Published private(set) var redoCount = 0
     private let store: MeetingStore
     private let modelProvider: () -> TranscriptionModel
     private let canAnalyze: () -> Bool
     private let onBusyChanged: (Bool) -> Void
+    private let transcriber: MeetingTranscriber
+    var noteGenerator: MeetingNoteGenerator?
+    var onOpenNotesSettings: (() -> Void)?
     private var operation: Task<Void, Never>?
     private var analysisGeneration = UUID()
     private var player: AVAudioPlayer?
@@ -32,11 +38,17 @@ final class MeetingEditorModel: ObservableObject {
     private var redoStack: [MeetingDocument] = []
 
     init(root: URL, modelProvider: @escaping () -> TranscriptionModel,
-         canAnalyze: @escaping () -> Bool = { true }, onBusyChanged: @escaping (Bool) -> Void = { _ in }) {
+         canAnalyze: @escaping () -> Bool = { true }, onBusyChanged: @escaping (Bool) -> Void = { _ in },
+         noteGenerator: MeetingNoteGenerator? = nil,
+         transcriber: @escaping MeetingTranscriber = { url, count, model, progress in
+             try await MeetingAnalysis.shared.analyze(audioURL: url, participantCount: count, model: model, progress: progress)
+         }) {
         store = MeetingStore(root: root)
         self.modelProvider = modelProvider
         self.canAnalyze = canAnalyze
         self.onBusyChanged = onBusyChanged
+        self.noteGenerator = noteGenerator
+        self.transcriber = transcriber
         refreshRecent()
     }
 
@@ -44,6 +56,12 @@ final class MeetingEditorModel: ObservableObject {
     var isInteractionBlocked: Bool { isBusy || isExternallyLocked }
     var hasAnalysis: Bool { !(document?.regions.isEmpty ?? true) }
     var isPlaybackAvailable: Bool { player != nil }
+    var hasUnsavedChanges: Bool { hasUnsavedEdits }
+    var transcriptText: String { document?.transcriptText ?? "" }
+    var canGenerateNotes: Bool {
+        noteGenerator != nil && !isInteractionBlocked
+            && document.map { document in document.regions.contains { !document.text(for: $0).isEmpty } } == true
+    }
     var selectedText: String { guard let document, let selected else { return "" }; return document.text(for: selected) }
     var canSplit: Bool { guard let selected else { return false }; return playhead > selected.start + 0.05 && playhead < selected.end - 0.05 }
 
@@ -62,15 +80,14 @@ final class MeetingEditorModel: ObservableObject {
         error = nil
         do {
             document = try store.importRecording(from: url)
-            participantCount = 2
-            configureSpeakers()
+            participantCount = 0
             refreshRecent()
             resetHistory()
             selectedID = nil
             playhead = 0
             zoom = 1
             preparePlayer()
-            prepareWaveform()
+            prepareWaveform(autoTranscribe: true)
         } catch { self.error = error.localizedDescription }
     }
 
@@ -80,7 +97,7 @@ final class MeetingEditorModel: ObservableObject {
             pause()
             document = try store.load(id: id)
             error = nil
-            participantCount = max(1, document?.speakers.count ?? 2)
+            participantCount = document?.participantCountHint ?? 0
             selectedID = nil
             playhead = 0
             zoom = 1
@@ -92,48 +109,164 @@ final class MeetingEditorModel: ObservableObject {
     }
 
     func configureSpeakers() {
-        guard !isInteractionBlocked, document != nil, !hasAnalysis else { return }
-        let count = min(9, max(1, participantCount))
+        guard !isInteractionBlocked, document != nil else { return }
+        let count = min(12, max(0, participantCount))
         participantCount = count
         edit { current in
-            let speakers = (0..<count).map { index in
-                current.speakers.first { $0.id == "speaker-\(index + 1)" }
-                    ?? MeetingSpeaker(id: "speaker-\(index + 1)", name: "Speaker \(index + 1)")
+            current.participantCountHint = count == 0 ? nil : count
+            if count > 0 {
+                while current.speakers.count < count { current.addSpeaker() }
+                for speaker in current.speakers.reversed() where current.speakers.count > count {
+                    _ = current.removeSpeaker(speaker.id)
+                }
             }
-            if speakers != current.speakers {
-                current.speakers = speakers
-                current.updatedAt = Date()
-            }
+            current.updatedAt = Date()
         }
     }
 
     func rename(_ id: String, _ name: String) {
+        guard !isInteractionBlocked else { return }
         edit { _ = $0.renameSpeaker(id: id, name: name) }
     }
 
-    private func prepareWaveform() {
+    func renameTitle(_ title: String) {
+        guard !isInteractionBlocked else { return }
+        edit { _ = $0.renameTitle(title) }
+    }
+
+    func updateText(regionID: String, text: String) {
+        guard !isInteractionBlocked else { return }
+        edit { _ = $0.replaceText(regionID: regionID, text: text) }
+    }
+
+    /// The caller presents explicit confirmation before discarding editorial text.
+    func resetTextCorrections() {
+        guard !isInteractionBlocked else { return }
+        edit { $0.textCorrections = []; $0.updatedAt = Date() }
+    }
+
+    func markReviewed(_ reviewed: Bool = true) {
+        guard !isInteractionBlocked else { return }
+        edit { $0.reviewedAt = reviewed ? Date() : nil; $0.updatedAt = Date() }
+    }
+
+    func addSpeaker(name: String = "", assignAllUnknown: Bool = false) {
+        guard !isInteractionBlocked else { return }
+        let selectedID = selectedID
+        edit { current in
+            let id = current.addSpeaker(name: name)
+            let targets = current.regions.filter {
+                $0.speakerIDs.isEmpty && (assignAllUnknown || $0.id == selectedID)
+            }.map(\.id)
+            for target in targets { current.assign(regionID: target, to: [id]) }
+        }
+    }
+
+    @discardableResult
+    func removeSpeaker(_ id: String) -> Bool {
+        guard !isInteractionBlocked else { return false }
+        var removed = false
+        edit { removed = $0.removeSpeaker(id) }
+        if !removed { error = "This speaker still has segments. Reassign those segments before removing the speaker." }
+        return removed
+    }
+
+    func setNotes(_ notes: MeetingNotes) {
+        edit {
+            guard $0.notes != notes else { return }
+            $0.notes = notes
+            $0.updatedAt = Date()
+        }
+    }
+
+    func updateNotes(_ change: (inout MeetingNotes) -> Void) {
+        guard !isInteractionBlocked else { return }
+        edit { current in
+            guard var notes = current.notes else { return }
+            let original = notes
+            change(&notes)
+            guard notes != original else { return }
+            current.notes = notes
+            current.updatedAt = Date()
+        }
+    }
+
+    func copyTranscript() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(transcriptText, forType: .string)
+    }
+
+    func exportTranscript() {
+        guard let document else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = "\(document.title).md"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { try Data(document.transcriptMarkdown.utf8).write(to: url, options: .atomic) }
+        catch { self.error = "Could not export the transcript: \(error.localizedDescription)" }
+    }
+
+    func generateNotes() {
+        guard canGenerateNotes, let current = document, let noteGenerator else { return }
+        guard canAnalyze() else { error = "Finish the current recording, transcription, or model preparation first."; return }
+        setBusy(true)
+        progress = 0
+        error = nil
+        status = "Preparing local meeting notes…"
+        let generation = UUID()
+        analysisGeneration = generation
+        operation = Task { [weak self] in
+            guard let self else { return }
+            defer { self.setBusy(false); self.operation = nil }
+            do {
+                var notes = try await noteGenerator(current) { [weak self] update in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.isBusy, self.analysisGeneration == generation, self.operation?.isCancelled == false else { return }
+                        self.progress = update.fraction
+                        self.status = update.message
+                    }
+                }
+                try Task.checkCancellation()
+                notes.sourceTranscriptHash = current.transcriptFingerprint
+                self.setNotes(notes)
+                self.status = "Notes ready · review and edit before sharing"
+            } catch is CancellationError { self.status = "Notes cancelled · your transcript is saved" }
+            catch { self.error = error.localizedDescription; self.status = "Could not generate meeting notes" }
+        }
+    }
+
+    private func prepareWaveform(autoTranscribe: Bool = false) {
         guard let document else { return }
         guard let url = audioURL(document) else { return }
         setBusy(true)
         status = "Preparing waveform…"
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { self.setBusy(false); self.operation = nil }
+            var startAnalysis = false
             do {
                 let wave = try await MeetingAnalysis.shared.waveform(audioURL: url)
                 try Task.checkCancellation()
                 self.document?.duration = wave.duration
                 self.document?.waveform = wave.peaks
-                self.status = "Ready · choose participants, then transcribe"
-                self.persist()
+                self.status = "Recording ready"
+                startAnalysis = self.persist() && autoTranscribe
                 self.refreshRecent()
             } catch is CancellationError { self.status = "Preparation cancelled. Reopen the session to retry." }
             catch { self.error = error.localizedDescription; self.status = "Could not prepare recording" }
+            // Complete this task before installing the transcription task. A defer
+            // from waveform preparation must never clear or unlock that next task.
+            self.operation = nil
+            self.setBusy(false)
+            if startAnalysis { self.transcribe() }
         }
     }
 
     func transcribe() {
         guard !isInteractionBlocked, let current = document else { return }
+        guard !current.hasTextCorrections else {
+            error = "This transcript has text corrections. Reset those corrections before running transcription again; speaker refinement keeps them intact."
+            return
+        }
         guard canAnalyze() else { error = "Finish the current recording, transcription, or model preparation first."; return }
         guard let url = audioURL(current) else { return }
         let model = modelProvider()
@@ -147,7 +280,7 @@ final class MeetingEditorModel: ObservableObject {
             guard let self else { return }
             defer { self.setBusy(false); self.operation = nil }
             do {
-                let result = try await MeetingAnalysis.shared.analyze(audioURL: url, participantCount: current.speakers.count, model: model) { [weak self] update in
+                let result = try await self.transcriber(url, current.participantCountHint ?? 0, model) { [weak self] update in
                     Task { @MainActor [weak self] in
                         guard let self, self.isBusy, self.analysisGeneration == generation, self.operation?.isCancelled == false else { return }
                         self.progress = update.fraction
@@ -156,6 +289,13 @@ final class MeetingEditorModel: ObservableObject {
                 }
                 try Task.checkCancellation()
                 self.edit {
+                    let discovered = Set(result.regions.flatMap(\.speakerIDs)).sorted {
+                        $0.localizedStandardCompare($1) == .orderedAscending
+                    }
+                    for id in discovered where !$0.speakers.contains(where: { $0.id == id }) {
+                        let number = id.replacingOccurrences(of: "speaker-", with: "")
+                        $0.speakers.append(.init(id: id, name: "Speaker \(number)"))
+                    }
                     $0.applyAnalysis(regions: result.regions, words: result.words)
                     $0.acousticEvidence = result.acousticEvidence
                 }
@@ -203,6 +343,10 @@ final class MeetingEditorModel: ObservableObject {
         let before = current
         change(&current)
         guard before != current else { return }
+        if before.regions != current.regions || before.words != current.words
+            || before.speakers != current.speakers || before.textCorrections != current.textCorrections {
+            current.reviewedAt = nil
+        }
         undoStack.append(before)
         if undoStack.count > 80 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -213,13 +357,13 @@ final class MeetingEditorModel: ObservableObject {
     func undo() {
         guard !isInteractionBlocked, let previous = undoStack.popLast(), let current = document else { return }
         redoStack.append(current); document = previous
-        participantCount = max(1, previous.speakers.count)
+        participantCount = previous.participantCountHint ?? 0
         updateHistoryCounts(); persist()
     }
     func redo() {
         guard !isInteractionBlocked, let next = redoStack.popLast(), let current = document else { return }
         undoStack.append(current); document = next
-        participantCount = max(1, next.speakers.count)
+        participantCount = next.participantCountHint ?? 0
         updateHistoryCounts(); persist()
     }
     private func resetHistory() { undoStack.removeAll(); redoStack.removeAll(); updateHistoryCounts() }

@@ -100,4 +100,32 @@ final class MeetingStoreTests: XCTestCase {
         XCTAssertTrue(warning.contains("Meeting saved"))
         XCTAssertEqual(try store.load(id: meeting.id).title, "Updated title")
     }
+
+    func testCorrectionsNotesAndReviewPersistAndExportWithoutReplacingRecognizedWords() throws {
+        let (directory, store, source) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var meeting = try store.importRecording(from: source)
+        meeting.duration = 10
+        meeting.speakers = [.init(id: "a", name: "Matteo")]
+        meeting.regions = [.init(id: "r", start: 0, end: 10, speakerIDs: ["a"])]
+        meeting.words = [.init(start: 1, end: 2, text: "Mistake")]
+        meeting.replaceText(regionID: "r", text: "Corrected fact")
+        meeting.reviewedAt = Date()
+        meeting.notes = .init(title: "Agreed title", summary: "Corrected fact [00:00:00]", keyTakeaways: ["A takeaway"],
+                              actionItems: ["Matteo to follow up"], modelID: "local-test", sourceTranscriptHash: meeting.transcriptFingerprint)
+        XCTAssertNil(try store.save(meeting))
+        let loaded = try store.load(id: meeting.id)
+        XCTAssertEqual(loaded, meeting)
+        XCTAssertEqual(loaded.words[0].text, "Mistake")
+        let session = try store.sessionURL(id: meeting.id)
+        let markdown = try String(contentsOf: session.appendingPathComponent("transcript.md"), encoding: .utf8)
+        XCTAssertEqual(markdown, meeting.transcriptMarkdown)
+        XCTAssertTrue(markdown.contains("Corrected fact"))
+        let notes = try String(contentsOf: session.appendingPathComponent("notes.md"), encoding: .utf8)
+        XCTAssertTrue(notes.contains("Corrected fact [00:00:00]"))
+        meeting.notes = nil
+        XCTAssertNil(try store.save(meeting))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.appendingPathComponent("notes.md").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: session.appendingPathComponent("notes.json").path))
+    }
 }

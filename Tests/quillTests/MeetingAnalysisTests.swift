@@ -4,6 +4,18 @@ import XCTest
 @testable import quill
 
 final class MeetingAnalysisTests: XCTestCase {
+    func testAutomaticCountDoesNotDiscardThirdVoice() {
+        let config = MeetingAnalysis.diarizerConfiguration(participantCount: 0)
+        XCTAssertNil(config.clustering.maxSpeakers)
+        let turns = [
+            MeetingDiarizedTurn(start: 0, end: 10, speakerID: "A", quality: 1),
+            MeetingDiarizedTurn(start: 10, end: 20, speakerID: "B", quality: 1),
+            MeetingDiarizedTurn(start: 20, end: 30, speakerID: "C", quality: 1),
+        ]
+        XCTAssertEqual(MeetingAnalysis.speakerMapping(turns: turns, participantCount: 0),
+                       ["A": "speaker-1", "B": "speaker-2", "C": "speaker-3"])
+    }
+
     func testMeetingConfigurationRetainsOverlapsAndShortReplies() {
         let config = MeetingAnalysis.diarizerConfiguration(participantCount: 3)
         XCTAssertFalse(config.exclusiveSegments)

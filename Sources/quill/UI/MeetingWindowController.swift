@@ -6,8 +6,9 @@ final class MeetingWindowController: NSWindowController, NSWindowDelegate {
     let model: MeetingEditorModel
 
     init(root: URL, modelProvider: @escaping () -> TranscriptionModel,
-         canAnalyze: @escaping () -> Bool = { true }, onBusyChanged: @escaping (Bool) -> Void = { _ in }) {
-        model = MeetingEditorModel(root: root, modelProvider: modelProvider, canAnalyze: canAnalyze, onBusyChanged: onBusyChanged)
+         canAnalyze: @escaping () -> Bool = { true }, onBusyChanged: @escaping (Bool) -> Void = { _ in },
+         noteGenerator: MeetingNoteGenerator? = nil) {
+        model = MeetingEditorModel(root: root, modelProvider: modelProvider, canAnalyze: canAnalyze, onBusyChanged: onBusyChanged, noteGenerator: noteGenerator)
         let hosting = NSHostingController(rootView: MeetingEditorView(model: model))
         let window = MeetingEditorWindow(contentViewController: hosting)
         window.editorModel = model
@@ -38,6 +39,13 @@ private final class MeetingEditorWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         // A menu-bar app has no standard Edit menu to route these commands.
         // Keep normal text editing available inside speaker-name fields.
+        if event.type == .keyDown, let field = firstResponder as? NSTextView,
+           event.modifierFlags.intersection([.command, .control, .option]) == .command,
+           (event.charactersIgnoringModifiers ?? "").lowercased() == "z" {
+            if event.modifierFlags.contains(.shift) { field.undoManager?.redo() }
+            else { field.undoManager?.undo() }
+            return
+        }
         if event.type == .keyDown, let field = firstResponder as? NSTextView,
            event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {
             switch (event.charactersIgnoringModifiers ?? "").lowercased() {

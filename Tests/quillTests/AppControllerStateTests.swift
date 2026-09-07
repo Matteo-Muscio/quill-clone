@@ -2,6 +2,19 @@ import XCTest
 @testable import quill
 
 final class AppControllerStateTests: XCTestCase {
+    func testNotesDownloadKeepsUpdateAndOtherModelWorkLocked() {
+        var state = AppBusyState()
+        state.isPreparingNotesModel = true
+        XCTAssertFalse(state.canPrepareUpdate)
+        XCTAssertFalse(state.canStartRecording)
+        XCTAssertFalse(state.canRetryTranscription)
+        XCTAssertTrue(state.modelActionsLocked)
+        state.isPreparingModel = false
+        XCTAssertFalse(state.canPrepareUpdate)
+        state.isPreparingNotesModel = false
+        XCTAssertTrue(state.canPrepareUpdate)
+    }
+
     func testImportedMeetingProcessingBlocksConflictingWorkAndUpdate() {
         var state = AppBusyState()
         state.isProcessingMeeting = true

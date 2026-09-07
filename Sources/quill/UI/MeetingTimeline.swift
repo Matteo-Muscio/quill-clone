@@ -5,6 +5,7 @@ import SwiftUI
 /// only change speaker attribution. Drawing is bounded to the visible time range.
 struct MeetingTimeline: NSViewRepresentable {
     @ObservedObject var model: MeetingEditorModel
+    var onCreateSpeaker: () -> Void = {}
 
     func makeNSView(context: Context) -> MeetingTimelineScrollView {
         let scroll = MeetingTimelineScrollView()
@@ -14,6 +15,7 @@ struct MeetingTimeline: NSViewRepresentable {
         scroll.drawsBackground = false
         let timeline = MeetingTimelineView()
         timeline.model = model
+        timeline.onCreateSpeaker = onCreateSpeaker
         timeline.setAccessibilityElement(true)
         timeline.setAccessibilityRole(.group)
         timeline.setAccessibilityLabel("Recording timeline. Use the playback slider and transcript below for keyboard review.")
@@ -24,6 +26,23 @@ struct MeetingTimeline: NSViewRepresentable {
     func updateNSView(_ scroll: MeetingTimelineScrollView, context: Context) {
         guard let timeline = scroll.documentView as? MeetingTimelineView else { return }
         timeline.model = model
+        timeline.onCreateSpeaker = onCreateSpeaker
+        timeline.synchronizeNameEditor()
+        if let document = model.document {
+            var actions = document.speakers.enumerated().map { lane, speaker in
+                NSAccessibilityCustomAction(name: "Rename \(speaker.name)") { [weak timeline] in
+                    guard let timeline, timeline.model?.isBusy == false else { return false }
+                    timeline.beginRenaming(speaker, documentID: document.id, lane: lane)
+                    return true
+                }
+            }
+            actions.append(NSAccessibilityCustomAction(name: "Add speaker from unassigned audio") { [weak timeline] in
+                guard let timeline, timeline.model?.isBusy == false else { return false }
+                timeline.onCreateSpeaker()
+                return true
+            })
+            timeline.setAccessibilityCustomActions(actions)
+        }
         scroll.updateGeometry()
         let width = max(1, scroll.contentSize.width)
         timeline.needsDisplay = true
@@ -72,6 +91,35 @@ final class MeetingTimelineScrollView: NSScrollView {
         }
     }
 
+    override func magnify(with event: NSEvent) {
+        zoomTimeline(with: event, factor: Double(1 + event.magnification))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if event.modifierFlags.contains(.option) {
+            zoomTimeline(with: event, factor: exp(Double(event.scrollingDeltaY) * 0.015))
+        } else {
+            super.scrollWheel(with: event)
+        }
+    }
+
+    func zoomTimeline(with event: NSEvent, factor: Double) {
+        guard let timeline = documentView as? MeetingTimelineView, let model = timeline.model,
+              factor.isFinite, factor > 0 else { return }
+        let point = timeline.convert(event.locationInWindow, from: nil)
+        let offset = max(150, point.x - contentView.bounds.minX)
+        let anchorTime = timeline.time(for: contentView.bounds.minX + offset)
+        let zoom = min(32, max(1, model.zoom * factor))
+        guard abs(zoom - model.zoom) > 0.0001 else { return }
+        // Prevent the subsequent SwiftUI update from substituting a selection anchor.
+        timeline.lastZoom = zoom
+        model.zoom = zoom
+        updateGeometry()
+        let target = max(0, min(timeline.bounds.width - contentSize.width, timeline.x(for: anchorTime) - offset))
+        contentView.scroll(to: NSPoint(x: target, y: contentView.bounds.minY))
+        reflectScrolledClipView(contentView)
+    }
+
     override func reflectScrolledClipView(_ clipView: NSClipView) {
         super.reflectScrolledClipView(clipView)
         documentView?.needsDisplay = true
@@ -79,8 +127,13 @@ final class MeetingTimelineScrollView: NSScrollView {
 }
 
 @MainActor
-final class MeetingTimelineView: NSView {
+final class MeetingTimelineView: NSView, NSTextFieldDelegate {
     weak var model: MeetingEditorModel?
+    var onCreateSpeaker: () -> Void = {}
+    private var nameField: NSTextField?
+    private var editingSpeakerID: String?
+    private var editingDocumentID: String?
+    private var startingNameEdit = false
     var lastSelectedID: String?
     var lastZoom = 1.0
     private var isScrubbing = false
@@ -98,7 +151,7 @@ final class MeetingTimelineView: NSView {
     func x(for time: Double) -> CGFloat {
         labelWidth + CGFloat(time / max(0.01, model?.document?.duration ?? 1)) * (bounds.width - labelWidth - 16)
     }
-    private func time(for x: CGFloat) -> Double {
+    fileprivate func time(for x: CGFloat) -> Double {
         min(model?.document?.duration ?? 0, max(0, Double((x - labelWidth) / max(1, bounds.width - labelWidth - 16)) * (model?.document?.duration ?? 1)))
     }
     private func row(for point: NSPoint) -> Int { Int(floor((point.y - trackTop) / laneHeight)) }
@@ -188,10 +241,14 @@ final class MeetingTimelineView: NSView {
         for lane in 0...document.speakers.count {
             let laneY = trackTop + CGFloat(lane) * laneHeight
             NSColor.separatorColor.setFill(); NSRect(x: labelX, y: laneY, width: labelWidth, height: 0.5).fill()
-            let title = lane < document.speakers.count ? "\(lane + 1)  \(document.speakers[lane].name)" : "Other / background"
+            let title = lane < document.speakers.count ? "\(lane + 1)  \(document.speakers[lane].name)" : "Unassigned"
             text(title, rect: NSRect(x: labelX + 16, y: laneY + 16, width: 126, height: 20), color: .labelColor, size: 11, bold: true)
         }
         NSColor.separatorColor.setFill(); NSRect(x: labelX + labelWidth - 1, y: 0, width: 1, height: bounds.height).fill()
+        if let id = editingSpeakerID, let field = nameField,
+           let lane = document.speakers.firstIndex(where: { $0.id == id }) {
+            field.frame.origin = NSPoint(x: labelX + 12, y: trackTop + CGFloat(lane) * laneHeight + 12)
+        }
     }
 
     private func drawWaveform(_ document: MeetingDocument, visible: NSRect) {
@@ -213,8 +270,14 @@ final class MeetingTimelineView: NSView {
         window?.makeFirstResponder(self)
         guard let model, let document = model.document else { return }
         let point = convert(event.locationInWindow, from: nil)
-        guard point.x > visibleRect.minX + labelWidth else { return }
         let lane = row(for: point)
+        if point.x <= visibleRect.minX + labelWidth {
+            if event.clickCount == 2, !model.isBusy, lane >= 0, lane <= document.speakers.count {
+                if lane == document.speakers.count { onCreateSpeaker() }
+                else { beginRenaming(document.speakers[lane], documentID: document.id, lane: lane) }
+            }
+            return
+        }
         if lane >= 0 && lane <= document.speakers.count,
            let hit = document.regions.last(where: { region in
                let belongs = lane == document.speakers.count ? region.speakerIDs.isEmpty : region.speakerIDs.contains(document.speakers[lane].id)
@@ -254,6 +317,71 @@ final class MeetingTimelineView: NSView {
             model.assign(lane == document.speakers.count ? [] : [document.speakers[lane].id])
         }
     }
+    override func magnify(with event: NSEvent) {
+        (enclosingScrollView as? MeetingTimelineScrollView)?.zoomTimeline(with: event, factor: Double(1 + event.magnification))
+    }
+
+    fileprivate func synchronizeNameEditor() {
+        if editingDocumentID != model?.document?.id || model?.isBusy == true || model?.isExternallyLocked == true {
+            finishRenaming()
+        }
+    }
+
+    fileprivate func beginRenaming(_ speaker: MeetingSpeaker, documentID: String, lane: Int) {
+        finishRenaming()
+        editingSpeakerID = speaker.id
+        editingDocumentID = documentID
+        let field = NSTextField(frame: NSRect(x: visibleRect.minX + 12, y: trackTop + CGFloat(lane) * laneHeight + 12, width: 128, height: 26))
+        field.stringValue = speaker.name
+        field.font = .systemFont(ofSize: 12, weight: .medium)
+        field.isEditable = true
+        field.isSelectable = true
+        field.delegate = self
+        field.setAccessibilityLabel("Speaker name")
+        addSubview(field)
+        nameField = field
+        setAccessibilityChildren([field])
+        // selectText performs the field-editor handoff itself. Doing a separate
+        // makeFirstResponder first can end the just-started edit synchronously.
+        startingNameEdit = true
+        field.selectText(nil)
+        startingNameEdit = false
+        needsDisplay = true
+        NSAccessibility.post(element: self, notification: .layoutChanged)
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = nameField,
+              notification.object as? NSTextField === field else { return }
+        saveSpeakerName(field)
+    }
+
+    private func saveSpeakerName(_ field: NSTextField) {
+        guard let id = editingSpeakerID, model?.document?.id == editingDocumentID else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty { model?.rename(id, name) }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard !startingNameEdit, let field = nameField,
+              notification.object as? NSTextField === field else { return }
+        finishRenaming()
+    }
+
+    private func finishRenaming() {
+        guard let field = nameField else { return }
+        saveSpeakerName(field)
+        field.delegate = nil
+        nameField = nil
+        editingSpeakerID = nil
+        editingDocumentID = nil
+        if field.currentEditor() != nil { window?.endEditing(for: field) }
+        field.removeFromSuperview()
+        setAccessibilityChildren([])
+        needsDisplay = true
+        NSAccessibility.post(element: self, notification: .layoutChanged)
+    }
+
     override func keyDown(with event: NSEvent) {
         guard let model else { return }
         let key = (event.charactersIgnoringModifiers ?? "").lowercased()

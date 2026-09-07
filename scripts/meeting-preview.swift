@@ -29,13 +29,32 @@ struct MeetingPreviewEntry {
         let menu = NSMenu()
         let appItem = NSMenuItem(title: "Quill Meeting Preview", action: nil, keyEquivalent: "")
         let appMenu = NSMenu()
+        let transcriptionModels = ModelManager()
+        let notesModels = NotesModelManager.shared
+        let settings = SettingsWindowController(modelManager: transcriptionModels, notesManager: notesModels)
+        let actions = PreviewActions(settings: settings)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(PreviewActions.showSettings), keyEquivalent: ",")
+        settingsItem.target = actions
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit Preview", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         menu.addItem(appItem)
         app.mainMenu = menu
-        let editor = MeetingWindowController(root: root, modelProvider: { .parakeetV3 })
+        let editor = MeetingWindowController(root: root, modelProvider: { transcriptionModels.activeModel },
+            canAnalyze: { !transcriptionModels.isPreparingModel && !notesModels.isPreparingModel },
+            onBusyChanged: { busy in
+                transcriptionModels.actionsLocked = busy
+                notesModels.actionsLocked = busy
+            })
+        editor.model.noteGenerator = { document, progress in
+            let selectedModel = NotesModelManager.shared.activeModel
+            return try await MeetingNotesEngine.shared.generate(
+                transcript: document.transcriptMarkdown, model: selectedModel, progress: progress)
+        }
+        editor.model.onOpenNotesSettings = { settings.show() }
         editor.show()
-        withExtendedLifetime(editor) { app.run() }
+        withExtendedLifetime((editor, settings, actions)) { app.run() }
     }
 
     static func analyze(root: URL, source: URL, participants: Int) async throws {
@@ -45,7 +64,8 @@ struct MeetingPreviewEntry {
         let waveform = try await MeetingAnalysis.shared.waveform(audioURL: store.audioURL(for: document))
         document.duration = waveform.duration
         document.waveform = waveform.peaks
-        document.speakers = (1...participants).map { MeetingSpeaker(id: "speaker-\($0)", name: "Speaker \($0)") }
+        document.speakers = participants > 0
+            ? (1...participants).map { MeetingSpeaker(id: "speaker-\($0)", name: "Speaker \($0)") } : []
         _ = try store.save(document)
         let result = try await MeetingAnalysis.shared.analyze(
             audioURL: store.audioURL(for: document), participantCount: participants, model: .parakeetV3
@@ -54,6 +74,9 @@ struct MeetingPreviewEntry {
         }
         document.words = result.words
         document.regions = result.regions
+        for id in Set(result.regions.flatMap(\.speakerIDs)).sorted() where !document.speakers.contains(where: { $0.id == id }) {
+            document.speakers.append(MeetingSpeaker(id: id, name: "Speaker \(document.speakers.count + 1)"))
+        }
         document.acousticEvidence = result.acousticEvidence
         document.provenance = "Parakeet v3 + FluidAudio offline diarization"
         // Keep failed integration output local for investigating bounds and
@@ -82,4 +105,11 @@ struct MeetingPreviewEntry {
         try data.write(to: root.appendingPathComponent("verification-summary.json"), options: .atomic)
         print(String(decoding: data, as: UTF8.self))
     }
+}
+
+@MainActor
+private final class PreviewActions: NSObject {
+    let settings: SettingsWindowController
+    init(settings: SettingsWindowController) { self.settings = settings }
+    @objc func showSettings() { settings.show() }
 }

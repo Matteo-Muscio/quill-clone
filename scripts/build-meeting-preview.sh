@@ -10,7 +10,7 @@ cat > "$preview_dir/Contents/Info.plist" <<'PLIST'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>dev.quill.meeting-preview</string>
-<key>CFBundleName</key><string>Quill Meeting Preview</string>
+<key>CFBundleName</key><string>QuillMeetingPreview</string>
 <key>CFBundleExecutable</key><string>QuillMeetingPreview</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>

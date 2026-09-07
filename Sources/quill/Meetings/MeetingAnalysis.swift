@@ -27,7 +27,7 @@ enum MeetingAnalysisError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .unreadableAudio: "This recording contains no readable audio."
-        case .invalidParticipants: "Choose between 1 and 12 participants."
+        case .invalidParticipants: "Choose Automatic or between 1 and 12 participants."
         case .noReferenceExamples:
             "Confirm clear, single-speaker sections for each active participant before refining (at least two). Longer sections provide better reference examples."
         case .noAcousticEvidence:
@@ -76,7 +76,7 @@ actor MeetingAnalysis {
         model: TranscriptionModel,
         progress: @escaping @Sendable (MeetingAnalysisProgress) -> Void = { _ in }
     ) async throws -> MeetingAnalysisResult {
-        guard (1...12).contains(participantCount) else { throw MeetingAnalysisError.invalidParticipants }
+        guard (0...12).contains(participantCount) else { throw MeetingAnalysisError.invalidParticipants }
         try Task.checkCancellation()
         let audioFile = try AVAudioFile(forReading: audioURL)
         let duration = Double(audioFile.length) / audioFile.processingFormat.sampleRate
@@ -101,8 +101,8 @@ actor MeetingAnalysis {
         progress(.init(fraction: 0.45, message: "Preparing speaker models · first use may download models"))
         let models = try await ModelStore.shared.loadMeetingDiarizerModels()
         try Task.checkCancellation()
-        // Participant count is a ceiling plus one background voice, not a
-        // requirement that every audible voice belongs to a named participant.
+        // Automatic leaves clustering unconstrained. An optional count is guidance
+        // with room for a background voice, never a fixed number of speakers.
         let config = Self.diarizerConfiguration(participantCount: participantCount)
         let diarizer = OfflineDiarizerManager(config: config)
         diarizer.initialize(models: models)
@@ -170,7 +170,9 @@ actor MeetingAnalysis {
     }
 
     nonisolated static func diarizerConfiguration(participantCount: Int) -> OfflineDiarizerConfig {
-        var config = OfflineDiarizerConfig.default.withSpeakers(min: 1, max: participantCount + 1)
+        var config = participantCount == 0
+            ? OfflineDiarizerConfig.default.withSpeakers(min: 1)
+            : OfflineDiarizerConfig.default.withSpeakers(min: 1, max: participantCount + 1)
         config.exposeChunkEmbeddings = true
         // The SDK's default trims away overlapping speakers and drops every
         // reconstructed turn shorter than a second. Meetings need interruptions
@@ -209,7 +211,7 @@ actor MeetingAnalysis {
         }
         let primary = Set(duration.sorted {
             $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value
-        }.prefix(participantCount).map(\.key))
+        }.prefix(participantCount == 0 ? duration.count : participantCount).map(\.key))
         var mapping: [String: String] = [:]
         for turn in turns.sorted(by: { $0.start < $1.start }) where primary.contains(turn.speakerID) {
             if mapping[turn.speakerID] == nil { mapping[turn.speakerID] = "speaker-\(mapping.count + 1)" }
