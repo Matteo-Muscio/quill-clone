@@ -1,0 +1,174 @@
+{
+  "description": "Ten synthetic Italian/English cases for local notes evaluation. Gold checklists are withheld from model input. These are not real recorded meetings.",
+  "cases": [
+    {
+      "id": "it-01",
+      "language": "Italian",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Pianificazione del sito",
+      "transcript": "# Pianificazione del sito\n\n[00:00:00] Speaker 1: La nuova pagina è pronta per la revisione interna, ma non la pubblichiamo oggi.\n\n[00:00:12] Speaker 2: Manca ancora il testo approvato. Potremmo andare online venerdì, se arriva in tempo.\n\n[00:00:25] Speaker 3: Per venerdì non posso promettere niente. Aspettiamo il testo prima di decidere una data.\n\n[00:00:38] Speaker 1: Va bene. Sara, puoi mandare a tutti il link della bozza entro domani?\n\n[00:00:49] Speaker 2: Sì, sono Sara e lo mando entro domani. Metto anche una nota con i punti ancora aperti.\n\n[00:01:03] Speaker 3: Quindi venerdì resta soltanto una possibilità. Non annunciamo una data di lancio.\n\n[00:01:15] Speaker 1: Esatto. Nessuna pubblicazione fino all’approvazione del testo.\n",
+      "expected": [
+        "The page is ready for internal review but publication awaits approved copy.",
+        "Friday is only a possibility; no launch date agreed.",
+        "Sara agreed to send the draft link and open points by tomorrow."
+      ],
+      "forbidden": [
+        "The site launches Friday.",
+        "The site was published today.",
+        "Speaker 1 or Speaker 3 owns the draft delivery."
+      ]
+    },
+    {
+      "id": "it-02",
+      "language": "Italian",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Controllo preventivo",
+      "transcript": "# Controllo preventivo\n\n[00:00:00] Speaker 1: Sul preventivo io leggo quindicimila euro per la prima fase.\n\n[00:00:09] Speaker 2: No, correggo subito: sono millecinquecento, non quindicimila. Ho appena controllato il documento.\n\n[00:00:22] Speaker 1: Bene, millecinquecento. La seconda fase non ha ancora un prezzo.\n\n[00:00:33] Speaker 3: Potrei chiamare il fornitore venerdì, ma non so ancora se riesco.\n\n[00:00:45] Speaker 2: Non assegnarti un impegno adesso. Per oggi approviamo solo la prima fase a millecinquecento euro.\n\n[00:00:58] Speaker 1: D’accordo. Chiediamo un preventivo separato per la seconda fase, senza fissare una scadenza.\n\n[00:01:12] Speaker 3: La richiesta può partire, ma dobbiamo ancora decidere chi la manda.\n",
+      "expected": [
+        "Only phase one is approved at 1500 euros, correcting 15000.",
+        "Phase two needs a separate quote; sender and deadline remain undecided."
+      ],
+      "forbidden": [
+        "15000 euros was approved.",
+        "The second phase is approved or priced.",
+        "Speaker 3 committed to calling Friday."
+      ]
+    },
+    {
+      "id": "it-03",
+      "language": "Italian",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Aggiornamento con audio disturbato",
+      "transcript": "# Aggiornamento con audio disturbato\n\n[00:00:00] Speaker 1: Il test del salvataggio è passato. La riapertura del file conserva le modifiche.\n\n[00:00:15] Unassigned: per il modulo elet... [parole non comprensibili] forse ma non saprei\n\n[00:00:26] Speaker 2: Quella parte non si sente. Non sappiamo quale modulo intendesse.\n\n[00:00:38] Speaker 1: Torniamo al punto chiaro: serve verificare che l’annullamento non cancelli il file originale.\n\n[00:00:50] Speaker 2: Me ne occupo io dopo la riunione e mando il risultato nel canale del progetto.\n\n[00:01:04] Speaker 1: Grazie. Sul modulo citato prima non prendiamo una decisione finché non abbiamo capito di cosa si tratta.\n",
+      "expected": [
+        "Save and reopen tests passed and preserve edits.",
+        "Speaker 2 agreed to test cancellation preserving the original and report in the project channel after the meeting.",
+        "The unclear module has no decision."
+      ],
+      "forbidden": [
+        "An electrical/electronic module was approved, installed or ordered.",
+        "A named person owns the cancellation test.",
+        "A specific calendar date was agreed."
+      ]
+    },
+    {
+      "id": "it-04",
+      "language": "Italian",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Invio del rapporto",
+      "transcript": "# Invio del rapporto\n\n[00:00:00] Speaker 1: Adesso mi serve il rapporto della prova, prima che inizi il controllo.\n\n[00:00:10] Speaker 2: Ce l’ho sul computer. Preferisci che te lo mandi su WhatsApp?\n\n[00:00:19] Speaker 1: No, per favore mandamelo per email. Su WhatsApp rischio di perderlo.\n\n[00:00:30] Speaker 2: Va bene, te lo invio per email subito dopo questa chiamata.\n\n[00:00:43] Speaker 3: In ottobre faremo un’altra revisione del progetto, se il cliente conferma.\n\n[00:00:57] Speaker 1: È una cosa separata. Il rapporto mi serve adesso; la revisione di ottobre è ancora da confermare.\n",
+      "expected": [
+        "Speaker 1 requested the report by email and Speaker 2 agreed to send it after the call.",
+        "The October project review is conditional on client confirmation and separate from immediate report delivery."
+      ],
+      "forbidden": [
+        "Send the report in October.",
+        "Send the report through WhatsApp.",
+        "The October review is confirmed."
+      ]
+    },
+    {
+      "id": "it-05",
+      "language": "Italian",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Revisione delle interviste",
+      "transcript": "# Revisione delle interviste\n\n[00:00:00] Speaker 1: Abbiamo concluso cinque interviste. Tre persone chiedono una ricerca più semplice, due vogliono esportare i dati.\n\n[00:00:14] Speaker 2: Non significa che dobbiamo costruire entrambe le funzioni subito. Il campione è piccolo.\n\n[00:00:27] Speaker 1: Sono d’accordo. Oggi raccogliamo osservazioni, senza approvare nuove funzionalità.\n\n[00:00:40] Speaker 3: Mi sembra una base utile per la prossima discussione. Non ho altro da aggiungere.\n\n[00:00:54] Speaker 2: Neanche io. Chiudiamo qui.\n\n[00:01:02] Speaker 3: Aspettate, ho lasciato il portafoglio in macchina. Lo vado a prendere, ciao.\n",
+      "expected": [
+        "Five interviews yielded three requests for simpler search and two for data export.",
+        "The small sample does not justify immediate implementation and no new features were approved.",
+        "No work action items were assigned."
+      ],
+      "forbidden": [
+        "Build both features.",
+        "Retrieve the wallet is a meeting action item.",
+        "A future meeting date or owner was agreed."
+      ]
+    },
+    {
+      "id": "en-01",
+      "language": "English",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Release planning",
+      "transcript": "# Release planning\n\n[00:00:00] Speaker 1: The desktop build passes the file-saving tests. That does not mean the release is approved.\n\n[00:00:14] Speaker 2: We could release Tuesday, but the accessibility review is still open.\n\n[00:00:25] Speaker 1: Keep Tuesday tentative. Morgan, can you finish the keyboard review by Monday afternoon?\n\n[00:00:38] Speaker 3: Yes. I am Morgan; I will finish that review by Monday afternoon and post the results.\n\n[00:00:51] Speaker 2: Once those results are in, we decide whether Tuesday works. No release announcement yet.\n\n[00:01:04] Speaker 1: Agreed. Saving tests passed, keyboard review next, then a separate release decision.\n",
+      "expected": [
+        "Saving tests pass but release is not approved.",
+        "Morgan commits to keyboard review and results by Monday afternoon.",
+        "Tuesday release is tentative pending review."
+      ],
+      "forbidden": [
+        "Release Tuesday is confirmed.",
+        "Accessibility review has passed.",
+        "Speaker 2 is Morgan or owns keyboard review."
+      ]
+    },
+    {
+      "id": "en-02",
+      "language": "English",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Delivery quantities",
+      "transcript": "# Delivery quantities\n\n[00:00:00] Speaker 1: The spreadsheet says we need eighteen units for the pilot.\n\n[00:00:12] Speaker 2: That is a typo. It should be eighty units, eight zero, for the pilot.\n\n[00:00:24] Speaker 1: Thanks. Eighty for the pilot. We are not approving the full rollout order today.\n\n[00:00:36] Speaker 3: I can ask the supplier about lead times, but I cannot commit to a delivery date.\n\n[00:00:49] Speaker 2: Please ask for the lead-time estimate. We have not assigned who will place the order.\n\n[00:01:02] Speaker 3: Yes, I will ask for that estimate. I will not place an order.\n\n[00:01:14] Speaker 1: Good. The only confirmed quantity is eighty for the pilot; delivery remains unknown.\n",
+      "expected": [
+        "Pilot quantity corrected from 18 to 80.",
+        "Speaker 3 agreed to request a lead-time estimate only.",
+        "Order owner and delivery date are unknown; full rollout not approved."
+      ],
+      "forbidden": [
+        "18 units are needed.",
+        "Speaker 3 will place the order.",
+        "A delivery date or full rollout is confirmed."
+      ]
+    },
+    {
+      "id": "en-03",
+      "language": "English",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Support handover",
+      "transcript": "# Support handover\n\n[00:00:00] Speaker 1: The customer cannot reopen the exported file. The original recording is still safe.\n\n[00:00:12] Unassigned: some kind of meta... electro... [inaudible] the system\n\n[00:00:22] Speaker 2: We did not catch that explanation. We should not treat it as the cause.\n\n[00:00:36] Speaker 1: Can someone request the error message from the customer? We do not need another copy of their recording.\n\n[00:00:48] Speaker 2: I will request the exact error message today. Then we can investigate.\n\n[00:01:01] Speaker 3: Do we know whether reinstalling fixes it?\n\n[00:01:10] Speaker 1: No. We have not tested a fix, so do not tell the customer it is solved.\n",
+      "expected": [
+        "Exported file cannot reopen; original recording remains safe.",
+        "Cause is unknown and a fix has not been tested.",
+        "Speaker 2 agreed to request the error message today, not another recording."
+      ],
+      "forbidden": [
+        "Reinstalling fixed the issue.",
+        "Request or upload the customer recording.",
+        "A garbled module name is the confirmed cause."
+      ]
+    },
+    {
+      "id": "en-04",
+      "language": "English",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Pricing discussion",
+      "transcript": "# Pricing discussion\n\n[00:00:00] Speaker 1: A monthly subscription is one option. A one-time purchase is another.\n\n[00:00:13] Speaker 2: I prefer a one-time purchase, but we have not looked at the support costs.\n\n[00:00:26] Speaker 3: I disagree. Recurring revenue might cover support better, although I have no estimate yet.\n\n[00:00:40] Speaker 1: We are discussing options only. No price or payment model has been chosen.\n\n[00:00:52] Speaker 2: All right. Let us leave the question open; nobody has an assigned follow-up today.\n\n[00:01:05] Speaker 3: Understood. Also, did anyone watch the football yesterday?\n\n[00:01:14] Speaker 1: We can talk about that afterwards. That is all for this meeting.\n",
+      "expected": [
+        "Subscription and one-time purchase remain options; participants disagree.",
+        "Support costs have not been estimated.",
+        "No pricing decision or assigned follow-up."
+      ],
+      "forbidden": [
+        "A subscription or one-time purchase was selected.",
+        "Someone must estimate support costs by a deadline.",
+        "Football is a key takeaway."
+      ]
+    },
+    {
+      "id": "en-05",
+      "language": "English",
+      "provenance": "Authored synthetic evaluation transcript; not a real recording.",
+      "scenario": "Facilities follow-up",
+      "transcript": "# Facilities follow-up\n\n[00:00:00] Speaker 1: The alarm check is complete. The second-floor sensor responded correctly.\n\n[00:00:11] Speaker 2: Please email the test certificate before the office closes today.\n\n[00:00:22] Speaker 3: I have the certificate, but I need permission to send it. I cannot promise delivery today.\n\n[00:00:35] Speaker 2: Understood. Keep it as a request, not a confirmed delivery.\n\n[00:00:47] Speaker 1: The annual inspection is planned for November. That is separate from sending the certificate.\n\n[00:01:00] Speaker 3: I will ask for permission to send the certificate. No deadline for that approval has been given.\n\n[00:01:15] Speaker 1: Fine. Do not repeat the alarm check; it is already complete.\n",
+      "expected": [
+        "Alarm check completed successfully; second-floor sensor responded.",
+        "Email certificate today was requested but delivery is not committed pending permission.",
+        "Speaker 3 agreed to seek permission with no approval deadline.",
+        "Annual inspection planned for November, separate from certificate delivery."
+      ],
+      "forbidden": [
+        "Certificate will be delivered today or in November.",
+        "Repeat the alarm check.",
+        "Permission has already been granted."
+      ]
+    }
+  ]
+}

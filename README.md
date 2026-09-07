@@ -190,14 +190,27 @@ mic/system transcription queue or run its hooks.
 ### Optional local meeting notes (experimental)
 
 Settings separates **Speech to text** from **Meeting notes**. Download and select
-Qwen3.5 2B Q4_K_M (1.27 GB) or SmolLM3 3B Q4_K_M (1.92 GB), then choose
-**Generate notes** in the transcript reading view. Notes include an editable
-suggested title, summary, key takeaways, and action items based on the corrected
-transcript. **Use as meeting title** applies the suggestion explicitly. Check
-generated claims and timestamp references against the recording. These small
-models can invent details, repeat points, confuse dates, or respond in the
-wrong language, particularly with noisy transcripts. Neither model is a
-verified substitute for reviewing the recording.
+Qwen3.5 2B Q4_K_M (1.27 GB), Qwen3.5 4B Q4_K_M (2.71 GB), or SmolLM3 3B
+Q4_K_M (1.92 GB). New imports automatically transcribe and generate notes when
+the selected notes model is ready. No wording corrections or speaker
+confirmations are required. Existing meetings have a **Generate notes** button;
+reopening a meeting does not regenerate or replace its notes.
+
+Draft notes open as readable text with a suggested title, summary, key takeaways,
+and agreed action items. **Edit notes** and individual transcript wording edits
+are optional. **Use as meeting title** applies the suggestion explicitly.
+Qwen3.5 4B supplies a collapsed **Sources** section linking generated claims to
+saved transcript excerpts and audio playback. Editing a generated claim clears its old source
+references; changing the transcript marks the notes and links as outdated.
+
+Qwen3.5 4B first extracts facts with source IDs, checks those IDs, retrieves
+the exact source text, then writes notes from that evidence. Requests and
+suggestions belong in takeaways unless explicitly accepted as future actions.
+An authentic quotation does not prove that a model interpreted it correctly:
+these small models can still omit facts or misread unclear speech. The notes
+remain experimental, and the source links are available when a detail matters.
+The smaller models retain direct generation: the extra extraction stage reduced
+their accuracy in local output checks. The default model choice is unchanged.
 
 Notes run on Apple silicon using a pinned llama.cpp worker downloaded from its
 official release alongside the model. Model and runtime downloads are checked
@@ -212,7 +225,17 @@ native editor using the real views and local inference. Its default test data
 stays under `.build/meeting-evidence/recordings`; set
 `QUILL_MEETING_TEST_ROOT` to choose another test root. The preview executable
 also accepts `analyze AUDIO_PATH PARTICIPANTS` for local pipeline verification
-without printing the transcript into the terminal.
+without printing the transcript into the terminal. For notes evaluation, use
+`notes TRANSCRIPT_PATH MODEL_ID STRATEGY OUTPUT_JSON`, where `STRATEGY` is
+`evidenceFirst` or `singlePass`. This developer command
+saves raw intermediate model output beside the result; the normal app does
+not retain intermediate prompts or model output.
+
+`scripts/notes-eval/run.py --help` describes the serial evaluation runner and
+native-app memory monitor. The ten Italian/English fixtures in
+`scripts/notes-eval/cases.json` are authored synthetic transcripts, not recorded
+meetings. Expected and forbidden claims never enter the model prompt. Keep
+real recordings, transcripts, and evaluation output outside the repository.
 
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.

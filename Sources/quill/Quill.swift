@@ -456,6 +456,10 @@ final class AppController {
                 )
             }
             meetingWindow?.model.onOpenNotesSettings = { [weak self] in self?.settingsWindow.show() }
+            meetingWindow?.model.shouldGenerateNotesAutomatically = { [weak self] in
+                guard let self else { return false }
+                return self.notesManager.state(for: self.notesManager.activeModel) == .active
+            }
         }
         meetingWindow?.show()
     }

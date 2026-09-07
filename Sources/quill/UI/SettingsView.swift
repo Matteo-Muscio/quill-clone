@@ -99,7 +99,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Meeting notes").font(.title2.weight(.semibold))
                         .accessibilityAddTraits(.isHeader)
-                    Text("Experimental. Generate a title, summary, key takeaways and action items from your corrected transcript. Review generated details against the recording.")
+                    Text("Experimental. New imports automatically produce notes after transcription when a notes model is ready. Wording edits and source playback are optional.")
                         .font(.callout).foregroundStyle(.secondary)
                     Text("Models load only when you generate notes and unload when the job finishes. Download once; generation works offline.")
                         .font(.callout).foregroundStyle(.secondary)
@@ -155,7 +155,7 @@ private struct NotesModelRow: View {
                 Text("Verifying the download…").font(.callout).foregroundStyle(.secondary)
                 Button("Cancel", action: manager.cancel)
             case .active:
-                Text("Used when you choose Generate notes in a meeting.")
+                Text("Used for automatic notes after import and when you choose Generate notes.")
                     .font(.callout).foregroundStyle(.secondary)
             case .installed:
                 Button("Use for notes") { manager.activate(model) }.disabled(locked)

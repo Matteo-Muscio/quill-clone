@@ -2,6 +2,7 @@
 // Usage: QuillMeetingPreview [analyze AUDIO_PATH PARTICIPANTS]
 // QUILL_MEETING_TEST_ROOT selects the persistent test root.
 import AppKit
+import CryptoKit
 import Foundation
 @testable import quill
 
@@ -11,6 +12,24 @@ struct MeetingPreviewEntry {
         let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["QUILL_MEETING_TEST_ROOT"]
             ?? Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("recordings").path)
         let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.first == "notes", arguments.count == 5 {
+            Task.detached {
+                do {
+                    guard let model = NotesModel(rawValue: arguments[2]),
+                          let strategy = MeetingNotesEngine.Strategy(rawValue: arguments[3]) else {
+                        throw NSError(domain: "MeetingPreview", code: 2,
+                                      userInfo: [NSLocalizedDescriptionKey: "Unknown notes model or strategy"])
+                    }
+                    try await generateNotes(source: URL(fileURLWithPath: arguments[1]), model: model,
+                                            strategy: strategy, output: URL(fileURLWithPath: arguments[4]))
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("Notes verification failed: \(error.localizedDescription)\n".utf8))
+                    exit(1)
+                }
+            }
+            dispatchMain()
+        }
         if arguments.first == "analyze", arguments.count == 3 {
             Task.detached {
                 do {
@@ -53,6 +72,9 @@ struct MeetingPreviewEntry {
                 transcript: document.transcriptMarkdown, model: selectedModel, progress: progress)
         }
         editor.model.onOpenNotesSettings = { settings.show() }
+        editor.model.shouldGenerateNotesAutomatically = {
+            notesModels.state(for: notesModels.activeModel) == .active
+        }
         editor.show()
         withExtendedLifetime((editor, settings, actions)) { app.run() }
     }
@@ -104,6 +126,31 @@ struct MeetingPreviewEntry {
         let data = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: root.appendingPathComponent("verification-summary.json"), options: .atomic)
         print(String(decoding: data, as: UTF8.self))
+    }
+
+    /// Bounded evaluation uses the same engine as the UI. Gold checklists never
+    /// enter the prompt; the harness reads only an explicitly supplied transcript.
+    static func generateNotes(source: URL, model: NotesModel, strategy: MeetingNotesEngine.Strategy,
+                              output: URL) async throws {
+        let transcript = try String(contentsOf: source, encoding: .utf8)
+        let started = Date()
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var notes = try await MeetingNotesEngine.shared.generate(transcript: transcript, model: model, strategy: strategy,
+            trace: { stage, data in
+                try? data.write(to: output.deletingLastPathComponent().appendingPathComponent("trace-\(stage)-\(UUID().uuidString).txt"), options: .atomic)
+            })
+        let elapsed = Date().timeIntervalSince(started)
+        notes.sourceTranscriptHash = SHA256.hash(data: Data(transcript.utf8)).map { String(format: "%02x", $0) }.joined()
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(notes).write(to: output, options: .atomic)
+        let metrics: [String: Any] = ["model": model.rawValue, "strategy": strategy.rawValue,
+                                     "elapsedSeconds": elapsed, "sourceSHA256": notes.sourceTranscriptHash ?? "",
+                                     "outputLanguage": MeetingNotesEngine.languageName(in: notes.title + "\n" + notes.summary) ?? "undetermined"]
+        let data = try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: output.appendingPathExtension("metrics.json"), options: .atomic)
+        print("\(model.rawValue) · \(strategy.rawValue) · \(String(format: "%.2f", elapsed)) seconds · saved \(output.path)")
     }
 }
 

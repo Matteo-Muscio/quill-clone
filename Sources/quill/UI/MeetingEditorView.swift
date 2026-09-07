@@ -35,6 +35,9 @@ struct MeetingEditorView: View {
         .frame(minWidth: 900, minHeight: 650)
         .overlay { if dropTarget { Rectangle().stroke(Color.accentColor, lineWidth: 3).allowsHitTesting(false) } }
         .onChange(of: model.document?.id) { _, _ in isReading = false }
+        .onChange(of: model.completedNotesGeneration) { _, generation in
+            if generation != nil { model.pause(); model.selectedID = nil; isReading = true }
+        }
         .sheet(isPresented: $showingAddSpeaker) { addSpeakerSheet }
         .confirmationDialog("Replace your wording corrections?", isPresented: $showingResetText) {
             Button("Reset wording and transcribe again", role: .destructive) { model.resetTextCorrections(); model.transcribe() }
@@ -298,6 +301,10 @@ struct MeetingEditorView: View {
                 Button(document.reviewedAt == nil ? "Mark reviewed" : "Mark as draft") { model.markReviewed(document.reviewedAt == nil) }
                     .disabled(model.isBusy)
                 Spacer()
+                Button { model.togglePlayback() } label: {
+                    Label(model.isPlaying ? "Pause audio" : "Play audio", systemImage: model.isPlaying ? "pause.fill" : "play.fill")
+                }.disabled(!model.isPlaybackAvailable)
+                Text(meetingTime(model.playhead)).font(.caption.monospaced()).foregroundStyle(.secondary)
                 Button("Copy", systemImage: "doc.on.doc") { model.copyTranscript() }
                 Button("Export…", systemImage: "square.and.arrow.up") { model.exportTranscript() }
             }.padding(.horizontal, MeetingStyle.inset).padding(.vertical, 12)
@@ -318,13 +325,13 @@ struct MeetingEditorView: View {
                             }
                         }
                         if document.notes != nil {
-                            if document.notesAreStale {
+                            if model.readingSnapshot.notesAreStale {
                                 Label("The transcript changed since these notes were generated. Regenerate to update them.", systemImage: "arrow.triangle.2.circlepath")
                                     .font(.callout).foregroundStyle(.secondary)
                             }
                             MeetingNotesEditor(model: model).id(document.id)
                         } else {
-                            Text("Generate a title, summary, key takeaways, and action items from the corrected transcript using a local model. You can edit the result.")
+                            Text("Generate a title, summary, key takeaways, and action items from this recording’s transcript using a local model. You can inspect sources or edit the result when useful.")
                                 .foregroundStyle(.secondary)
                             if notesModelManager.state(for: notesModelManager.activeModel) != .active {
                                 Text("Set up a meeting notes model in Quill Settings to generate notes.").font(.callout).foregroundStyle(.secondary)
@@ -334,7 +341,7 @@ struct MeetingEditorView: View {
                     Divider()
                     Text("Full transcript").font(.title3.weight(.semibold))
                     LazyVStack(alignment: .leading, spacing: 18) {
-                        ForEach(document.transcriptParagraphs) { region in
+                        ForEach(model.readingSnapshot.documentID == document.id ? model.readingSnapshot.paragraphs : []) { region in
                             VStack(alignment: .leading, spacing: 5) {
                                 HStack(spacing: 10) {
                                     Text(region.speakerIDs.compactMap { id in document.speakers.first { $0.id == id }?.name }.joined(separator: " + ").nonEmpty ?? "Unassigned")
@@ -498,22 +505,60 @@ private struct MeetingTranscriptRow: View {
 
 private struct MeetingNotesEditor: View {
     @ObservedObject var model: MeetingEditorModel
+    @State private var editing = false
 
     var body: some View {
         if let notes = model.document?.notes {
             VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    TextField("Suggested title", text: Binding(get: { model.document?.notes?.title ?? "" }, set: { value in model.updateNotes { $0.title = value } }))
-                        .textFieldStyle(.roundedBorder).font(.headline).accessibilityLabel("Meeting notes title")
+                HStack(alignment: .top, spacing: 10) {
+                    if editing {
+                        TextField("Suggested title", text: Binding(get: { model.document?.notes?.title ?? "" }, set: { value in model.updateNotes { $0.title = value } }))
+                            .textFieldStyle(.roundedBorder).font(.headline).accessibilityLabel("Meeting notes title")
+                    } else {
+                        Text(notes.title).font(.headline).textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                     Button("Use as meeting title") { model.renameTitle(notes.title) }
                         .disabled(notes.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button(editing ? "Done" : "Edit notes") { editing.toggle() }
                 }
-                notesField("Summary", text: Binding(get: { model.document?.notes?.summary ?? "" }, set: { value in model.updateNotes { $0.summary = value } }), height: 90)
-                notesField("Key takeaways · one per line", text: Binding(get: { model.document?.notes?.keyTakeaways.joined(separator: "\n") ?? "" }, set: { value in model.updateNotes { $0.keyTakeaways = value.components(separatedBy: "\n") } }), height: 85)
-                notesField("Action items · one per line", text: Binding(get: { model.document?.notes?.actionItems.joined(separator: "\n") ?? "" }, set: { value in model.updateNotes { $0.actionItems = value.components(separatedBy: "\n") } }), height: 85)
-                Text("Generated locally with \(notes.modelID) · Review the notes against the transcript.")
+                if editing {
+                    notesField("Summary", text: Binding(get: { model.document?.notes?.summary ?? "" }, set: { value in model.updateNotes { $0.summary = value } }), height: 90)
+                    notesField("Key takeaways · one per line", text: Binding(get: { model.document?.notes?.keyTakeaways.joined(separator: "\n") ?? "" }, set: { value in model.updateNotes { $0.keyTakeaways = value.components(separatedBy: "\n") } }), height: 85)
+                    notesField("Action items · one per line", text: Binding(get: { model.document?.notes?.actionItems.joined(separator: "\n") ?? "" }, set: { value in model.updateNotes { $0.actionItems = value.components(separatedBy: "\n") } }), height: 85)
+                } else {
+                    if !notes.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(notes.summary).font(.body).lineSpacing(4).textSelection(.enabled)
+                    }
+                    notesList("Key takeaways", items: notes.keyTakeaways)
+                    notesList("Action items", items: notes.actionItems, emptyText: "No agreed actions identified.")
+                }
+                Text("Draft notes generated on this Mac with \(NotesModel(rawValue: notes.modelID)?.displayName ?? notes.modelID).")
                     .font(.caption).foregroundStyle(.secondary)
+                if let document = model.document, !(notes.citations?.isEmpty ?? true) {
+                    MeetingNotesSources(model: model, document: document, notes: notes)
+                }
             }.disabled(model.isBusy)
+                .onChange(of: notes.generatedAt) { _, _ in editing = false }
+        }
+    }
+
+    private func notesList(_ title: String, items: [String], emptyText: String? = nil) -> some View {
+        let visible = Array(items.enumerated()).filter { !$0.element.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return VStack(alignment: .leading, spacing: 8) {
+            if !visible.isEmpty || emptyText != nil {
+                Text(title).font(.callout.weight(.semibold))
+            }
+            ForEach(visible, id: \.offset) { _, item in
+                HStack(alignment: .top, spacing: 8) {
+                    Text("•").foregroundStyle(.secondary)
+                    Text(item).font(.body).lineSpacing(3).textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if visible.isEmpty, let emptyText {
+                Text(emptyText).font(.callout).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -524,6 +569,72 @@ private struct MeetingNotesEditor: View {
                 .padding(5).background(Color(nsColor: .textBackgroundColor))
                 .overlay(Rectangle().stroke(Color(nsColor: .separatorColor), lineWidth: 0.5))
                 .accessibilityLabel(label)
+        }
+    }
+}
+
+/// Evidence is available on demand, without interrupting automatic note generation.
+private struct MeetingNotesSources: View {
+    @ObservedObject var model: MeetingEditorModel
+    let document: MeetingDocument
+    let notes: MeetingNotes
+
+    var body: some View {
+        if model.readingSnapshot.notesAreStale {
+            Text("Source links refer to an earlier transcript. Regenerate notes to refresh them.")
+                .font(.caption).foregroundStyle(.secondary)
+        } else {
+            let groups = model.readingSnapshot.documentID == document.id ? model.readingSnapshot.sourceGroups : []
+            if !groups.isEmpty {
+                DisclosureGroup("Sources") {
+                    VStack(alignment: .leading, spacing: 16) {
+                        ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                            let citation = group.citation
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(label(for: citation)).font(.caption.weight(.semibold))
+                                if citation.section != .summary {
+                                    Text(noteText(for: citation)).font(.callout).foregroundStyle(.secondary)
+                                }
+                                ForEach(group.sources, id: \.id) { source in
+                                    HStack(alignment: .top, spacing: 12) {
+                                        Button {
+                                            guard model.document?.id == document.id,
+                                                  model.readingSnapshot.documentID == document.id,
+                                                  !model.readingSnapshot.notesAreStale,
+                                                  model.readingSnapshot.sourceGroups.contains(group) else { return }
+                                            model.seek(source.start)
+                                            if !model.isPlaying { model.togglePlayback() }
+                                        } label: {
+                                            Label(meetingTime(source.start), systemImage: "play.fill")
+                                                .font(.caption.monospaced())
+                                        }.controlSize(.small)
+                                            .disabled(!model.isPlaybackAvailable)
+                                            .accessibilityLabel("Play \(label(for: citation).lowercased()) source at \(meetingTime(source.start))")
+                                        Text(source.text).font(.callout).textSelection(.enabled)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
+                            }
+                        }
+                    }.padding(.top, 10)
+                }.font(.callout)
+            }
+        }
+    }
+
+    private func label(for citation: MeetingNotesCitation) -> String {
+        switch citation.section {
+        case .summary: "Summary"
+        case .keyTakeaway: "Key takeaway \(citation.index + 1)"
+        case .actionItem: "Action item \(citation.index + 1)"
+        }
+    }
+
+    private func noteText(for citation: MeetingNotesCitation) -> String {
+        switch citation.section {
+        case .summary: notes.summary
+        case .keyTakeaway: notes.keyTakeaways.indices.contains(citation.index) ? notes.keyTakeaways[citation.index] : ""
+        case .actionItem: notes.actionItems.indices.contains(citation.index) ? notes.actionItems[citation.index] : ""
         }
     }
 }
