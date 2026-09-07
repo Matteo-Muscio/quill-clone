@@ -237,6 +237,14 @@ native-app memory monitor. The ten Italian/English fixtures in
 meetings. Expected and forbidden claims never enter the model prompt. Keep
 real recordings, transcripts, and evaluation output outside the repository.
 
+For audio comparisons, the preview accepts
+`transcribe AUDIO_PATH MODEL_ID PROFILE OUTPUT_JSON`. The
+[audio evaluation runner](scripts/audio-eval/README.md) compares supplied audio
+variants with explicit model settings and optional reference transcripts. It
+records input hashes, timing, memory, and word/character error rates. The app
+continues to use its existing audio path and ASR defaults; experimental cleanup
+and denoising are not enabled by this developer harness.
+
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.
 

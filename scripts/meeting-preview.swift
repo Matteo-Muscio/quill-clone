@@ -1,7 +1,11 @@
 // Developer verification harness. Audio and output stay in the isolated root.
 // Usage: QuillMeetingPreview [analyze AUDIO_PATH PARTICIPANTS]
+//        QuillMeetingPreview transcribe AUDIO MODEL_ID current|multilingual OUTPUT_JSON
 // QUILL_MEETING_TEST_ROOT selects the persistent test root.
 import AppKit
+import AVFoundation
+import Darwin
+import FluidAudio
 import CryptoKit
 import Foundation
 @testable import quill
@@ -12,6 +16,30 @@ struct MeetingPreviewEntry {
         let root = URL(fileURLWithPath: ProcessInfo.processInfo.environment["QUILL_MEETING_TEST_ROOT"]
             ?? Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("recordings").path)
         let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.first == "transcribe" {
+            guard arguments.count == 5 else {
+                FileHandle.standardError.write(Data("Usage: transcribe AUDIO MODEL_ID current|multilingual OUTPUT_JSON\n".utf8))
+                exit(2)
+            }
+            Task.detached {
+                do {
+                    guard let model = TranscriptionModel(rawValue: arguments[2]),
+                          ["current", "multilingual"].contains(arguments[3]),
+                          arguments[3] != "multilingual" || model == .parakeetV3 else {
+                        throw NSError(domain: "MeetingPreview", code: 2)
+                    }
+                    try await transcribe(source: URL(fileURLWithPath: arguments[1]), model: model,
+                                         profile: arguments[3], output: URL(fileURLWithPath: arguments[4]))
+                    exit(0)
+                } catch {
+                    // SDK errors and diagnostic output may contain recognized
+                    // words. Keep console failure reporting content-free.
+                    FileHandle.standardError.write(Data("Audio evaluation failed (\((error as NSError).domain), code \((error as NSError).code)). No transcript was printed.\n".utf8))
+                    exit(1)
+                }
+            }
+            dispatchMain()
+        }
         if arguments.first == "notes", arguments.count == 5 {
             Task.detached {
                 do {
@@ -126,6 +154,93 @@ struct MeetingPreviewEntry {
         let data = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: root.appendingPathComponent("verification-summary.json"), options: .atomic)
         print(String(decoding: data, as: UTF8.self))
+    }
+
+    /// Isolated ASR evaluation: no diarization, note generation or model download.
+    /// Both profiles explicitly pin their config so a later app default change
+    /// cannot silently relabel an evaluation baseline.
+    static func transcribe(source: URL, model: TranscriptionModel, profile: String, output: URL) async throws {
+        guard !FileManager.default.fileExists(atPath: output.path) else {
+            throw NSError(domain: "MeetingPreviewOutputExists", code: 17)
+        }
+        let audio = try AVAudioFile(forReading: source)
+        guard audio.length > 0, audio.processingFormat.sampleRate.isFinite, audio.processingFormat.sampleRate > 0 else {
+            throw NSError(domain: "MeetingPreviewEmptyAudio", code: 2)
+        }
+        let duration = Double(audio.length) / audio.processingFormat.sampleRate
+        let hash = try fileSHA256(source)
+        let started = Date()
+        let melChunkContext = profile == "current"
+        let engine = ParakeetEngine(model: model, asrConfig: ASRConfig(melChunkContext: melChunkContext))
+
+        // Silence both SDK streams while inference runs. Results are written only
+        // to the explicitly supplied local JSON file, never terminal/tool output.
+        let savedOut = dup(STDOUT_FILENO), savedError = dup(STDERR_FILENO)
+        let sink = open("/dev/null", O_WRONLY)
+        guard savedOut >= 0, savedError >= 0, sink >= 0 else {
+            if savedOut >= 0 { close(savedOut) }
+            if savedError >= 0 { close(savedError) }
+            if sink >= 0 { close(sink) }
+            throw NSError(domain: "MeetingPreviewOutputRedirection", code: 2)
+        }
+        fflush(nil)
+        dup2(sink, STDOUT_FILENO); dup2(sink, STDERR_FILENO); close(sink)
+        defer {
+            fflush(nil)
+            dup2(savedOut, STDOUT_FILENO); dup2(savedError, STDERR_FILENO)
+            close(savedOut); close(savedError)
+        }
+        struct Word: Codable { var text: String; var start: Double; var end: Double }
+        let words: [Word]
+        let preparationSeconds: Double
+        let transcriptionSeconds: Double
+        do {
+            try await engine.prepare()
+            preparationSeconds = Date().timeIntervalSince(started)
+            let inferenceStarted = Date()
+            let timings = try await engine.transcribeWords(source)
+            transcriptionSeconds = Date().timeIntervalSince(inferenceStarted)
+            words = timings.map { Word(text: $0.word, start: $0.startTime, end: $0.endTime) }
+            await engine.release()
+        } catch {
+            await engine.release()
+            throw error
+        }
+        struct Result: Codable {
+            var schemaVersion = 1
+            var model: String
+            var modelProvenance: String
+            var profile: String
+            var melChunkContext: Bool
+            var inputPath: String
+            var inputSHA256: String
+            var durationSeconds: Double
+            var elapsedSeconds: Double
+            var preparationSeconds: Double
+            var transcriptionSeconds: Double
+            var words: [Word]
+            var transcript: String
+        }
+        let result = Result(model: model.rawValue, modelProvenance: model.provenance,
+                            profile: profile, melChunkContext: melChunkContext, inputPath: source.path,
+                            inputSHA256: hash, durationSeconds: duration, elapsedSeconds: Date().timeIntervalSince(started),
+                            preparationSeconds: preparationSeconds, transcriptionSeconds: transcriptionSeconds,
+                            words: words, transcript: words.map(\.text).joined(separator: " "))
+        try FileManager.default.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        // Exclusive creation also catches an output created after the early check.
+        try encoder.encode(result).write(to: output, options: .withoutOverwriting)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: output.path)
+    }
+
+    static func fileSHA256(_ url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hash = SHA256()
+        while let bytes = try handle.read(upToCount: 1_048_576), !bytes.isEmpty { hash.update(data: bytes) }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// Bounded evaluation uses the same engine as the UI. Gold checklists never
