@@ -7,7 +7,66 @@ serial. Expected and forbidden claims in `cases.json` never enter the prompt.
 Raw notes, intermediate outputs, timing, source hashes, and sampled process
 memory remain in the chosen output directory. Earlier notes are not overwritten.
 
-## September 7, 2026 comparison
+## September 7, 2026 follow-up: generation controls and verification
+
+**The tested changes did not improve the held-out results. Application defaults
+remain unchanged.** Thirteen conditions produced 39 outputs on three known
+Italian/English development cases. They tested atomic extraction with adjacent
+context, fact and final-claim checks, temperatures 0/0.2/0.4/0.7, top-p 0.8/0.95,
+top-k 20/40/disabled, and extraction thinking caps of 512/2048 tokens. This was a
+staged comparison, not a full factorial search. Changing filters or adding
+thinking did not eliminate the development status error. The full verifier
+removed unsupported claims but discarded four useful expected facts.
+
+One finalist was frozen before reviewing unseen outcomes: existing extraction,
+the revised renderer, adjacent context, and final-claim verification, with atomic
+extraction and fact verification disabled. Its development output retained 9
+full and 1 partial expected facts out of 10, with one noncritical unsupported
+priority. The control retained all 10 but had two unsupported claims, one critical.
+
+The frozen finalist and control then generated 48 outputs: eight new synthetic
+cases, two methods, and seeds 7, 42 and 2026. Two agents reviewed anonymized,
+balanced batches against a fixed source-based rubric. The implementation and
+candidate settings were not tuned on these outcomes. Full coverage earns 1,
+partial coverage 0.5; 33 substantive expected facts repeated across three seeds
+give 99 assessments per method. The no-clear-facts case is scored separately.
+
+| Qwen3.5 4B condition | Full / partial / missing | Weighted coverage | Unsupported claims (critical) | Median time | Peak sampled RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current evidence path | 76 / 17 / 6 | 85.4% | 9 (7) | 16.91 s | 3.13 GiB |
+| Frozen finalist | 66 / 19 / 14 | 76.3% | 11 (8) | 28.22 s | 3.03 GiB |
+
+Both methods appropriately abstained in all three no-clear-facts runs. All 48
+outputs passed generation, language and citation-ID checks. These structural
+checks did not establish factual correctness. The finalist lost coverage at
+every seed; in one run it suppressed all four expected facts in a clear case.
+It still introduced causal, unit and completion-status errors. “Critical” here
+means a consequential change to a number/unit, owner, status, timing, polarity or
+causal relationship, not a statistical confidence level.
+
+This is a small, model-reviewed synthetic evaluation, not a human-validated
+accuracy benchmark. Borderline wording was adjudicated consistently before
+condition labels were opened; no cases or failed interpretations were excluded.
+The eight seed-42 control outputs used the frozen prior binary; rebuilt controls
+use the same baseline behavior, with exact-content reproduction checked on a
+development case and the real transcript. Both finalists used temperature 0.7,
+top-p 0.8, top-k 20, no thinking, 8,192 context tokens and 2,200 output tokens.
+
+Both methods were also repeated three times on one unchanged real automatic
+transcript. All three control runs completed; the finalist completed two and
+failed one when its verifier returned the same target ID twice. The failure was
+retained and was not rerun or counted as successful abstention. This transcript
+has no human-listening reference, so its review assesses text faithfulness only.
+
+The new pipeline and generation controls remain developer experiments. The app
+continues to use its existing evidence path for 4B and direct generation for the
+smaller models. A separate Astra Low comparison used the same real-transcript
+extraction/rendering instructions and schemas, but different host context and
+runtime. It is a useful comparison output, not gold or a hard upper bound.
+Private recordings, transcripts, raw outputs and detailed score sheets remain
+outside this repository.
+
+## Earlier September 7 model comparison
 
 Ten authored synthetic Italian/English transcripts contain 29 expected facts.
 These fixtures were used during development, so this is a development check,
