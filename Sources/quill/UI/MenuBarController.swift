@@ -19,6 +19,7 @@ final class MenuBarController {
     var onToggle: (() -> Void)?
     var onOpenSoundSettings: (() -> Void)?
     var onOpenSettings: (() -> Void)?
+    var onOpenMeetingEditor: (() -> Void)?
     var onOpenFolder: (() -> Void)?
     var onQuit: (() -> Void)?
     var onRetrySave: (() -> Void)?
@@ -95,6 +96,14 @@ final class MenuBarController {
         )
         menu.addItem(openFolder)
 
+        let meetingEditor = NSMenuItem(
+            title: "Edit an imported recording…",
+            action: #selector(openMeetingEditorClicked),
+            keyEquivalent: "i"
+        )
+        meetingEditor.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+        menu.addItem(meetingEditor)
+
         menu.addItem(.separator())
 
         let settings = NSMenuItem(
@@ -114,7 +123,7 @@ final class MenuBarController {
         menu.addItem(quit)
 
         for item in [toggleItem, retrySaveItem, retryTranscriptionItem, setupTranscriptionItem,
-                     openSoundSettingsItem, openFolder, settings, quit] {
+                     openSoundSettingsItem, openFolder, meetingEditor, settings, quit] {
             item.target = self
         }
 
@@ -253,6 +262,7 @@ final class MenuBarController {
     @objc private func toggleClicked() { onToggle?() }
     @objc private func openSoundSettingsClicked() { onOpenSoundSettings?() }
     @objc private func openSettingsClicked() { onOpenSettings?() }
+    @objc private func openMeetingEditorClicked() { onOpenMeetingEditor?() }
     @objc private func openFolderClicked() { onOpenFolder?() }
     @objc private func quitClicked() { onQuit?() }
     @objc private func retrySaveClicked() { onRetrySave?() }

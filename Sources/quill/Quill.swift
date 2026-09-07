@@ -88,6 +88,7 @@ struct AppBusyState {
     var isPreparingModel = false
     var hasUnsavedRecording = false
     var isPreparingUpdate = false
+    var isProcessingMeeting = false
     var micHealth: MicCaptureHealth = .healthy
 
     var recordingIndicator: RecordingIndicator {
@@ -96,20 +97,21 @@ struct AppBusyState {
     }
 
     var modelActionsLocked: Bool {
-        isRecording || isTranscribing || isPreparingUpdate
+        isRecording || isTranscribing || isPreparingUpdate || isProcessingMeeting
     }
 
     var canStartRecording: Bool {
-        !isPreparingModel && !hasUnsavedRecording && !isPreparingUpdate
+        !isPreparingModel && !hasUnsavedRecording && !isPreparingUpdate && !isProcessingMeeting
     }
 
     var canRetryTranscription: Bool {
         !isPreparingModel && !isTranscribing && !hasUnsavedRecording && !isPreparingUpdate
+            && !isProcessingMeeting
     }
 
     var canPrepareUpdate: Bool {
         !isRecording && !isTranscribing && !isPreparingModel
-            && !hasUnsavedRecording && !isPreparingUpdate
+            && !hasUnsavedRecording && !isPreparingUpdate && !isProcessingMeeting
     }
 
     mutating func finishRecording(transcriptionEnabled: Bool) {
@@ -136,6 +138,7 @@ final class AppController {
     private var statusTask: Task<Void, Never>?
     private let submittedWork = SubmittedCoordinatorWork()
     private var updateHandoff: UpdateHandoff?
+    private var meetingWindow: MeetingWindowController?
 
     init(root: URL) {
         self.root = root
@@ -159,6 +162,7 @@ final class AppController {
 
         menuBar.onToggle = { [weak self] in self?.toggle() }
         menuBar.onOpenSettings = { [weak self] in self?.settingsWindow.show() }
+        menuBar.onOpenMeetingEditor = { [weak self] in self?.showMeetingEditor() }
         menuBar.onOpenFolder = { [weak self] in self?.openFolder() }
         menuBar.onQuit = { [weak self] in self?.shutdown() }
         menuBar.onOpenSoundSettings = { [weak self] in self?.openSoundSettings() }
@@ -211,6 +215,14 @@ final class AppController {
 
     /// Stop any live session cleanly (finalizing files) and exit.
     func shutdown() {
+        guard !busyState.isProcessingMeeting else {
+            meetingWindow?.show()
+            notifyUser(
+                title: "quill — meeting editor is busy",
+                body: "Finish or cancel the current operation and save your edits before quitting."
+            )
+            return
+        }
         stopSession()
         guard pendingSave == nil else {
             notifyUser(
@@ -351,9 +363,12 @@ final class AppController {
     }
 
     private func syncBusyState() {
+        // Freeze new edits before the updater yields to the transcription
+        // coordinator; no import/save can race the final cooperative exit.
+        meetingWindow?.model.isExternallyLocked = busyState.isPreparingUpdate
         modelManager.actionsLocked = busyState.modelActionsLocked
         menuBar.updateModelPreparation(
-            busyState.isPreparingModel,
+            busyState.isPreparingModel || busyState.isProcessingMeeting,
             recording: busyState.isRecording,
             hasUnsavedRecording: busyState.hasUnsavedRecording
         )
@@ -400,6 +415,25 @@ final class AppController {
     private func openFolder() {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         NSWorkspace.shared.open(root)
+    }
+
+    private func showMeetingEditor() {
+        guard !busyState.isPreparingUpdate else { return }
+        if meetingWindow == nil {
+            meetingWindow = MeetingWindowController(
+                root: root,
+                modelProvider: { Config.transcriptionModel() },
+                canAnalyze: { [weak self] in
+                    guard let self else { return false }
+                    return busyState.canPrepareUpdate && submittedWork.pendingCount == 0
+                },
+                onBusyChanged: { [weak self] busy in
+                    self?.busyState.isProcessingMeeting = busy
+                    self?.syncBusyState()
+                }
+            )
+        }
+        meetingWindow?.show()
     }
 
     private static func format(_ interval: TimeInterval) -> String {
