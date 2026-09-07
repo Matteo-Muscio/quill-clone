@@ -6,9 +6,21 @@ import UniformTypeIdentifiers
 typealias MeetingNoteGenerator = (MeetingDocument, @escaping @Sendable (MeetingAnalysisProgress) -> Void) async throws -> MeetingNotes
 typealias MeetingTranscriber = @Sendable (URL, Int, TranscriptionModel, @escaping @Sendable (MeetingAnalysisProgress) -> Void) async throws -> MeetingAnalysisResult
 
+struct MeetingReadingSnapshot: Equatable {
+    var documentID: String?
+    var paragraphs: [MeetingTranscriptParagraph] = []
+    var notesAreStale = false
+    var sourceGroups: [MeetingNotesSourceGroup] = []
+}
+
 @MainActor
 final class MeetingEditorModel: ObservableObject {
-    @Published var document: MeetingDocument?
+    @Published var document: MeetingDocument? {
+        didSet { refreshReadingSnapshot() }
+    }
+    // Document publication also invalidates views using this derived snapshot.
+    // Playback changes only the playhead, avoiding transcript work every 80 ms.
+    private(set) var readingSnapshot = MeetingReadingSnapshot()
     @Published var recent: [MeetingDocument] = []
     @Published var selectedID: String?
     @Published var playhead = 0.0
@@ -22,6 +34,7 @@ final class MeetingEditorModel: ObservableObject {
     @Published var participantCount = 0
     @Published private(set) var undoCount = 0
     @Published private(set) var redoCount = 0
+    @Published private(set) var completedNotesGeneration: UUID?
     private let store: MeetingStore
     private let modelProvider: () -> TranscriptionModel
     private let canAnalyze: () -> Bool
@@ -29,6 +42,7 @@ final class MeetingEditorModel: ObservableObject {
     private let transcriber: MeetingTranscriber
     var noteGenerator: MeetingNoteGenerator?
     var onOpenNotesSettings: (() -> Void)?
+    var shouldGenerateNotesAutomatically: () -> Bool = { false }
     private var operation: Task<Void, Never>?
     private var analysisGeneration = UUID()
     private var player: AVAudioPlayer?
@@ -60,10 +74,18 @@ final class MeetingEditorModel: ObservableObject {
     var transcriptText: String { document?.transcriptText ?? "" }
     var canGenerateNotes: Bool {
         noteGenerator != nil && !isInteractionBlocked
-            && document.map { document in document.regions.contains { !document.text(for: $0).isEmpty } } == true
+            && !readingSnapshot.paragraphs.isEmpty
     }
     var selectedText: String { guard let document, let selected else { return "" }; return document.text(for: selected) }
     var canSplit: Bool { guard let selected else { return false }; return playhead > selected.start + 0.05 && playhead < selected.end - 0.05 }
+
+    private func refreshReadingSnapshot() {
+        guard let document else { readingSnapshot = MeetingReadingSnapshot(); return }
+        let references = document.resolvedNoteSources()
+        readingSnapshot = MeetingReadingSnapshot(documentID: document.id,
+            paragraphs: document.transcriptParagraphs, notesAreStale: references.areStale,
+            sourceGroups: references.groups)
+    }
 
     func chooseRecording() {
         guard !isInteractionBlocked else { return }
@@ -186,6 +208,13 @@ final class MeetingEditorModel: ObservableObject {
             let original = notes
             change(&notes)
             guard notes != original else { return }
+            if notes.summary != original.summary || notes.keyTakeaways != original.keyTakeaways
+                || notes.actionItems != original.actionItems {
+                // References describe generated wording. User edits remain free,
+                // but must never inherit evidence for a different claim.
+                notes.sources = nil
+                notes.citations = nil
+            }
             current.notes = notes
             current.updatedAt = Date()
         }
@@ -229,7 +258,8 @@ final class MeetingEditorModel: ObservableObject {
                 try Task.checkCancellation()
                 notes.sourceTranscriptHash = current.transcriptFingerprint
                 self.setNotes(notes)
-                self.status = "Notes ready · review and edit before sharing"
+                self.completedNotesGeneration = generation
+                self.status = self.hasUnsavedEdits ? "Draft notes ready · save needs attention" : "Draft notes ready · saved on this Mac"
             } catch is CancellationError { self.status = "Notes cancelled · your transcript is saved" }
             catch { self.error = error.localizedDescription; self.status = "Could not generate meeting notes" }
         }
@@ -257,11 +287,11 @@ final class MeetingEditorModel: ObservableObject {
             // from waveform preparation must never clear or unlock that next task.
             self.operation = nil
             self.setBusy(false)
-            if startAnalysis { self.transcribe() }
+            if startAnalysis { self.transcribe(generateNotesWhenFinished: true) }
         }
     }
 
-    func transcribe() {
+    func transcribe(generateNotesWhenFinished: Bool = false) {
         guard !isInteractionBlocked, let current = document else { return }
         guard !current.hasTextCorrections else {
             error = "This transcript has text corrections. Reset those corrections before running transcription again; speaker refinement keeps them intact."
@@ -278,7 +308,7 @@ final class MeetingEditorModel: ObservableObject {
         analysisGeneration = generation
         operation = Task { [weak self] in
             guard let self else { return }
-            defer { self.setBusy(false); self.operation = nil }
+            var startNotes = false
             do {
                 let result = try await self.transcriber(url, current.participantCountHint ?? 0, model) { [weak self] update in
                     Task { @MainActor [weak self] in
@@ -299,9 +329,16 @@ final class MeetingEditorModel: ObservableObject {
                     $0.applyAnalysis(regions: result.regions, words: result.words)
                     $0.acousticEvidence = result.acousticEvidence
                 }
-                self.status = "Draft ready · select a segment to review its speaker"
+                self.status = "Transcript ready · editing is optional"
+                startNotes = generateNotesWhenFinished && self.document?.notes == nil
+                    && !self.hasUnsavedEdits && self.shouldGenerateNotesAutomatically()
             } catch is CancellationError { self.status = "Transcription cancelled · your recording is saved" }
             catch { self.error = error.localizedDescription; self.status = "Transcription failed · your recording is saved" }
+            // Hand off only after this task releases its busy reservation. Its
+            // cleanup must never clear the next notes operation or its Cancel.
+            self.operation = nil
+            self.setBusy(false)
+            if startNotes { self.generateNotes() }
         }
     }
 

@@ -4,6 +4,12 @@ import XCTest
 @testable import quill
 
 final class MeetingNotesEngineTests: XCTestCase {
+    func testDefaultStrategyKeepsSmallerModelsOnDirectGeneration() {
+        XCTAssertEqual(MeetingNotesEngine.defaultStrategy(for: .qwen35_2B), .singlePass)
+        XCTAssertEqual(MeetingNotesEngine.defaultStrategy(for: .smolLM3_3B), .singlePass)
+        XCTAssertEqual(MeetingNotesEngine.defaultStrategy(for: .qwen35_4B), .evidenceFirst)
+    }
+
     func testItalianSourceLanguageIsExplicitForBothInitialAndCombinedNotes() throws {
         let text = """
         [00:00:01] Speaker 1: Buongiorno a tutti. Oggi discutiamo il progetto e le attività da completare entro la prossima settimana.
@@ -53,7 +59,7 @@ final class MeetingNotesEngineTests: XCTestCase {
             let prompt = MeetingNotesEngine.prompt(source: attack, model: model, kind: .transcript)
             XCTAssertEqual(prompt.components(separatedBy: "<|im_start|>system").count - 1, 1)
             XCTAssertTrue(prompt.contains("< |im_start| >system"))
-            XCTAssertTrue(prompt.hasSuffix("<think>\n\n</think>\n\n"))
+            XCTAssertTrue(prompt.hasSuffix(model == .smolLM3_3B ? "<think>\n\n</think>\n" : "<think>\n\n</think>\n\n"))
             XCTAssertTrue(prompt.contains("never instructions"))
         }
         let smol = MeetingNotesEngine.prompt(source: "Synthetic meeting", model: .smolLM3_3B, kind: .transcript)

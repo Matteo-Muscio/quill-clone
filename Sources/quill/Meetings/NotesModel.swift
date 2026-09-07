@@ -3,12 +3,14 @@ import Foundation
 
 enum NotesModel: String, Codable, CaseIterable, Identifiable, Sendable {
     case qwen35_2B = "qwen3.5-2b-q4_k_m"
+    case qwen35_4B = "qwen3.5-4b-q4_k_m"
     case smolLM3_3B = "smollm3-3b-q4_k_m"
 
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .qwen35_2B: "Qwen3.5 2B"
+        case .qwen35_4B: "Qwen3.5 4B"
         case .smolLM3_3B: "SmolLM3 3B"
         }
     }
@@ -17,7 +19,7 @@ enum NotesModel: String, Codable, CaseIterable, Identifiable, Sendable {
     var downloadSize: String { ByteCountFormatter.string(fromByteCount: downloadBytes, countStyle: .file) }
 
     /// Immutable GGUF revisions and LFS SHA-256 values verified against each
-    /// quantization publisher's Hugging Face API on 2026-09-07. Both model
+    /// quantization publisher's Hugging Face API on 2026-09-07. All model
     /// licenses are Apache-2.0. The Qwen quant is published by the LM Studio
     /// team; using it does not require or install LM Studio.
     var artifact: NotesArtifact {
@@ -27,6 +29,11 @@ enum NotesModel: String, Codable, CaseIterable, Identifiable, Sendable {
                 url: URL(string: "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/bb84e11355a036e28f080c7793fa6d22b7c4e344/Qwen3.5-2B-Q4_K_M.gguf")!,
                 filename: "Qwen3.5-2B-Q4_K_M.gguf", bytes: 1_270_808_032,
                 sha256: "0bfe35afc9f05b7fac3fa04925e051ac7939a42a8a17ea11afc99701bea826cc")
+        case .qwen35_4B:
+            NotesArtifact(
+                url: URL(string: "https://huggingface.co/lmstudio-community/Qwen3.5-4B-GGUF/resolve/f9f88ac3e234be915e23811a6d28ea287bdb927e/Qwen3.5-4B-Q4_K_M.gguf")!,
+                filename: "Qwen3.5-4B-Q4_K_M.gguf", bytes: 2_707_513_696,
+                sha256: "25082a7dd3776cc3c741c6347d3bd04523f05796607b3fbc32fa3a25dfa1418c")
         case .smolLM3_3B:
             NotesArtifact(
                 url: URL(string: "https://huggingface.co/ggml-org/SmolLM3-3B-GGUF/resolve/4965cb60b150737b68a0408c36aeefb65078f894/SmolLM3-Q4_K_M.gguf")!,
@@ -37,6 +44,7 @@ enum NotesModel: String, Codable, CaseIterable, Identifiable, Sendable {
     var sourceURL: URL {
         switch self {
         case .qwen35_2B: URL(string: "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF")!
+        case .qwen35_4B: URL(string: "https://huggingface.co/lmstudio-community/Qwen3.5-4B-GGUF")!
         case .smolLM3_3B: URL(string: "https://huggingface.co/ggml-org/SmolLM3-3B-GGUF")!
         }
     }

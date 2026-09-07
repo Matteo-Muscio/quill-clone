@@ -199,4 +199,66 @@ final class MeetingDocumentTests: XCTestCase {
         XCTAssertTrue(meeting.notesAreStale)
         XCTAssertEqual(meeting.notes?.summary, "Edited summary")
     }
+    func testLegacyNotesDecodeWithoutEvidenceFields() throws {
+        let notes = MeetingNotes(title: "Lunch", summary: "A summary", keyTakeaways: ["A point"],
+                                 actionItems: [], modelID: "local")
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(notes)) as? [String: Any])
+        object.removeValue(forKey: "sources")
+        object.removeValue(forKey: "citations")
+        let decoded = try JSONDecoder().decode(MeetingNotes.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(decoded.summary, notes.summary)
+        XCTAssertEqual(decoded.keyTakeaways, notes.keyTakeaways)
+        XCTAssertNil(decoded.sources)
+        XCTAssertNil(decoded.citations)
+    }
+
+    func testNotesEvidenceRoundTripsAndResolvesExactOrderedSources() throws {
+        var meeting = document()
+        let citation = MeetingNotesCitation(section: .summary, index: 0, sourceIDs: ["line-5", "line-3", "line-5"])
+        meeting.notes = MeetingNotes(title: "Lunch", summary: "A summary", keyTakeaways: [], actionItems: [],
+                                     modelID: "local", sourceTranscriptHash: meeting.transcriptFingerprint,
+                                     sources: [.init(id: "line-3", start: 2.25, text: "[00:00:02] Matteo: Original words."),
+                                               .init(id: "line-5", start: 10, text: "[00:00:10] Elena: Another exact excerpt.")],
+                                     citations: [citation])
+        let decoded = try JSONDecoder().decode(MeetingDocument.self, from: JSONEncoder().encode(meeting))
+        XCTAssertEqual(decoded.notes, meeting.notes)
+        XCTAssertEqual(decoded.noteSources(for: citation).map(\.id), ["line-5", "line-3"])
+        XCTAssertEqual(decoded.noteSources(for: citation).map(\.start), [10, 2.25])
+        XCTAssertEqual(decoded.noteSources(for: citation).last?.text, "[00:00:02] Matteo: Original words.")
+        XCTAssertEqual(decoded.words, meeting.words, "Evidence must not alter recognized words.")
+    }
+
+    func testInvalidNotesReferencesDoNotResolveToPlaybackTargets() {
+        var meeting = document()
+        let citation = MeetingNotesCitation(section: .keyTakeaway, index: 0,
+                                            sourceIDs: ["missing", "duplicate", "negative", "infinite", "past-end", "good"])
+        let outOfBounds = MeetingNotesCitation(section: .actionItem, index: 4, sourceIDs: ["good"])
+        meeting.notes = MeetingNotes(title: "Lunch", summary: "", keyTakeaways: ["A point"], actionItems: [], modelID: "local",
+                                     sources: [.init(id: "duplicate", start: 1, text: "First"),
+                                               .init(id: "duplicate", start: 2, text: "Conflicting"),
+                                               .init(id: "negative", start: -1, text: "Invalid"),
+                                               .init(id: "infinite", start: .infinity, text: "Invalid"),
+                                               .init(id: "past-end", start: meeting.duration, text: "Invalid"),
+                                               .init(id: "good", start: 3, text: "Exact valid source")],
+                                     citations: [citation, outOfBounds])
+        XCTAssertEqual(meeting.noteSources(for: citation).map(\.id), ["good"])
+        XCTAssertTrue(meeting.noteSources(for: outOfBounds).isEmpty)
+        XCTAssertEqual(meeting.notes?.keyTakeaways, ["A point"], "Bad references must not discard useful notes.")
+    }
+
+    func testTranscriptChangesDisableEvidenceWithoutDiscardingNotes() {
+        var meeting = document()
+        let citation = MeetingNotesCitation(section: .actionItem, index: 0, sourceIDs: ["line-3"])
+        meeting.notes = MeetingNotes(title: "Lunch", summary: "", keyTakeaways: [], actionItems: ["A stated action"],
+                                     modelID: "local", sourceTranscriptHash: meeting.transcriptFingerprint,
+                                     sources: [.init(id: "line-3", start: 1, text: "Original transcript excerpt")],
+                                     citations: [citation])
+        XCTAssertEqual(meeting.noteSources(for: citation).count, 1)
+        meeting.replaceText(regionID: "first", text: "An edited transcript")
+        XCTAssertTrue(meeting.notesAreStale)
+        XCTAssertTrue(meeting.noteSources(for: citation).isEmpty)
+        XCTAssertEqual(meeting.notes?.actionItems, ["A stated action"])
+        XCTAssertEqual(meeting.notes?.sources?.first?.text, "Original transcript excerpt")
+    }
+
 }

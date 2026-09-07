@@ -39,6 +39,28 @@ struct MeetingTextCorrection: Codable, Sendable, Equatable, Identifiable {
     var text: String
 }
 
+enum MeetingNotesSection: String, Codable, Sendable, Equatable {
+    case summary, keyTakeaway, actionItem
+}
+
+/// Exact excerpts from the exported transcript used for a generation.
+struct MeetingNotesSource: Codable, Sendable, Equatable {
+    var id: String
+    var start: Double
+    var text: String
+}
+
+struct MeetingNotesCitation: Codable, Sendable, Equatable {
+    var section: MeetingNotesSection
+    var index: Int
+    var sourceIDs: [String]
+}
+
+struct MeetingNotesSourceGroup: Sendable, Equatable {
+    var citation: MeetingNotesCitation
+    var sources: [MeetingNotesSource]
+}
+
 struct MeetingNotes: Codable, Sendable, Equatable {
     var title: String
     var summary: String
@@ -47,6 +69,8 @@ struct MeetingNotes: Codable, Sendable, Equatable {
     var modelID: String
     var generatedAt: Date = Date()
     var sourceTranscriptHash: String? = nil
+    var sources: [MeetingNotesSource]? = nil
+    var citations: [MeetingNotesCitation]? = nil
 }
 
 struct MeetingTranscriptParagraph: Sendable, Equatable, Identifiable {
@@ -84,6 +108,44 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
     var notesAreStale: Bool {
         guard let source = notes?.sourceTranscriptHash else { return false }
         return source != transcriptFingerprint
+    }
+
+    /// Source inspection is optional. Invalid or outdated references never seek
+    /// to unrelated audio, and do not make an otherwise usable meeting unreadable.
+    func noteSources(for citation: MeetingNotesCitation) -> [MeetingNotesSource] {
+        resolvedNoteSources().groups.first { $0.citation == citation }?.sources ?? []
+    }
+
+    /// Resolve every citation against one freshness check; transcript hashing is
+    /// deliberately outside the per-citation work and the playback render loop.
+    func resolvedNoteSources() -> (areStale: Bool, groups: [MeetingNotesSourceGroup]) {
+        let stale = notesAreStale
+        guard let notes, !stale else { return (stale, []) }
+        let groups = (notes.citations ?? []).compactMap { citation -> MeetingNotesSourceGroup? in
+            let sources = noteSources(for: citation, notes: notes)
+            return sources.isEmpty ? nil : .init(citation: citation, sources: sources)
+        }
+        return (false, groups)
+    }
+
+    private func noteSources(for citation: MeetingNotesCitation, notes: MeetingNotes) -> [MeetingNotesSource] {
+        let itemExists: Bool
+        switch citation.section {
+        case .summary: itemExists = citation.index == 0 && !notes.summary.isEmpty
+        case .keyTakeaway: itemExists = notes.keyTakeaways.indices.contains(citation.index)
+        case .actionItem: itemExists = notes.actionItems.indices.contains(citation.index)
+        }
+        guard itemExists else { return [] }
+        let sources = notes.sources ?? []
+        let counts = sources.reduce(into: [String: Int]()) { $0[$1.id, default: 0] += 1 }
+        var seen = Set<String>()
+        return citation.sourceIDs.compactMap { id in
+            guard seen.insert(id).inserted, counts[id] == 1,
+                  let source = sources.first(where: { $0.id == id }),
+                  source.start.isFinite, source.start >= 0, source.start < duration,
+                  !source.text.isEmpty else { return nil }
+            return source
+        }
     }
 
     private enum CodingKeys: String, CodingKey {

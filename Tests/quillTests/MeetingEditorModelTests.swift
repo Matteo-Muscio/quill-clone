@@ -245,6 +245,133 @@ final class MeetingEditorModelTests: XCTestCase {
         XCTAssertFalse(model.document?.regions[1].speakerIDs.isEmpty ?? true)
     }
 
+    func testFreshImportGeneratesNotesWithoutAnyTranscriptEditsOrReview() async throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var notesCalls = 0
+        let model = MeetingEditorModel(root: root, modelProvider: { .default }, noteGenerator: { snapshot, _ in
+            notesCalls += 1
+            XCTAssertTrue(snapshot.textCorrections.isEmpty)
+            XCTAssertNil(snapshot.reviewedAt)
+            XCTAssertFalse(snapshot.regions.contains(where: \.isConfirmed))
+            XCTAssertTrue(snapshot.transcriptMarkdown.contains("Send the report"))
+            return .init(title: "Report", summary: "The report was requested.", keyTakeaways: [], actionItems: [], modelID: "test-local")
+        }, transcriber: { _, _, _, _ in
+            .init(words: [.init(start: 0, end: 0.2, text: "Send the report")],
+                  regions: [.init(start: 0, end: 0.5, speakerIDs: ["speaker-1"])], acousticEvidence: [])
+        })
+        model.shouldGenerateNotesAutomatically = { true }
+        model.importRecording(try store.audioURL(for: original))
+        for _ in 0..<300 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNil(model.error)
+        XCTAssertEqual(notesCalls, 1)
+        XCTAssertNotNil(model.completedNotesGeneration)
+        XCTAssertEqual(model.document?.notes?.title, "Report")
+        let saved = try store.load(id: XCTUnwrap(model.document?.id))
+        XCTAssertEqual(saved.notes, model.document?.notes)
+        // Reopening a completed recording does not repeat inference or replace notes.
+        model.open(saved.id)
+        XCTAssertEqual(notesCalls, 1)
+        XCTAssertFalse(model.isBusy)
+    }
+
+    func testAutomaticNotesHandoffRemainsCancellableAndPreservesTranscript() async throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var notesStarted = false
+        let model = MeetingEditorModel(root: root, modelProvider: { .default }, noteGenerator: { _, _ in
+            notesStarted = true
+            try await Task.sleep(for: .seconds(30))
+            return .init(title: "Not reached", summary: "Not reached", keyTakeaways: [], actionItems: [], modelID: "test-local")
+        }, transcriber: { _, _, _, _ in
+            .init(words: [.init(start: 0, end: 0.2, text: "Keep these words")],
+                  regions: [.init(start: 0, end: 0.5, speakerIDs: ["speaker-1"])], acousticEvidence: [])
+        })
+        model.shouldGenerateNotesAutomatically = { true }
+        model.importRecording(try store.audioURL(for: original))
+        for _ in 0..<300 where !notesStarted { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertTrue(notesStarted)
+        XCTAssertTrue(model.isBusy)
+        model.cancel()
+        for _ in 0..<300 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.document?.notes)
+        XCTAssertNil(model.completedNotesGeneration)
+        XCTAssertTrue(model.status.contains("cancelled"))
+        let saved = try store.load(id: XCTUnwrap(model.document?.id))
+        XCTAssertEqual(saved.words.first?.text, "Keep these words")
+    }
+
+    func testEditingGeneratedClaimsDropsTheirOldReferencesButTitleEditDoesNot() throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var meeting = original
+        meeting.notes = .init(title: "Notes", summary: "A request", keyTakeaways: [], actionItems: [], modelID: "test-local",
+            sources: [.init(id: "s1", start: 0, text: "Send the report")],
+            citations: [.init(section: .summary, index: 0, sourceIDs: ["s1"])])
+        try store.save(meeting)
+        let model = MeetingEditorModel(root: root, modelProvider: { .default })
+        model.open(meeting.id)
+        XCTAssertEqual(model.readingSnapshot.sourceGroups.count, 1)
+        model.updateNotes { $0.title = "My title" }
+        XCTAssertEqual(model.document?.notes?.citations?.count, 1)
+        XCTAssertEqual(model.readingSnapshot.sourceGroups.count, 1)
+        model.updateNotes { $0.summary = "A different claim" }
+        XCTAssertNil(model.document?.notes?.citations)
+        XCTAssertNil(model.document?.notes?.sources)
+        XCTAssertTrue(model.readingSnapshot.sourceGroups.isEmpty)
+        model.undo()
+        XCTAssertEqual(model.document?.notes?.citations?.count, 1)
+        XCTAssertEqual(model.readingSnapshot.sourceGroups.count, 1)
+    }
+
+    func testReadingSnapshotTracksTranscriptUndoAndDocumentChangesWhileSeekingKeepsSources() throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var meeting = original
+        meeting.words = [.init(start: 0, end: 0.5, text: "Send the report")]
+        meeting.regions = [.init(id: "one", start: 0, end: 0.5, speakerIDs: ["speaker-1"])]
+        meeting.notes = .init(title: "Notes", summary: "A request", keyTakeaways: [], actionItems: [], modelID: "test-local",
+            sourceTranscriptHash: meeting.transcriptFingerprint,
+            sources: [.init(id: "s1", start: 0.1, text: "Send the report")],
+            citations: [.init(section: .summary, index: 0, sourceIDs: ["s1"])])
+        try store.save(meeting)
+        let model = MeetingEditorModel(root: root, modelProvider: { .default })
+        model.open(meeting.id)
+        let initial = model.readingSnapshot
+        XCTAssertEqual(initial.documentID, meeting.id)
+        XCTAssertEqual(initial.paragraphs.map(\.text), ["Send the report"])
+        XCTAssertFalse(initial.notesAreStale)
+        XCTAssertEqual(initial.sourceGroups.first?.sources.first?.id, "s1")
+        model.seek(0.2)
+        XCTAssertEqual(model.readingSnapshot, initial)
+
+        model.updateText(regionID: "one", text: "Send the revised report")
+        XCTAssertEqual(model.readingSnapshot.paragraphs.map(\.text), ["Send the revised report"])
+        XCTAssertTrue(model.readingSnapshot.notesAreStale)
+        XCTAssertTrue(model.readingSnapshot.sourceGroups.isEmpty)
+        model.undo()
+        XCTAssertEqual(model.readingSnapshot, initial)
+        model.redo()
+        XCTAssertTrue(model.readingSnapshot.notesAreStale)
+        model.undo()
+
+        // Nested document mutations also refresh time-range validation.
+        model.document?.duration = 0.05
+        XCTAssertTrue(model.readingSnapshot.sourceGroups.isEmpty)
+        // Restore a valid recording before open() persists the current session.
+        model.document?.duration = meeting.duration
+        XCTAssertEqual(model.readingSnapshot, initial)
+        var next = try store.importRecording(from: store.audioURL(for: meeting))
+        next.waveform = [0]
+        try store.save(next)
+        model.open(next.id)
+        XCTAssertEqual(model.readingSnapshot.documentID, next.id)
+        XCTAssertTrue(model.readingSnapshot.paragraphs.isEmpty)
+        XCTAssertTrue(model.readingSnapshot.sourceGroups.isEmpty)
+        XCTAssertFalse(model.readingSnapshot.notesAreStale)
+    }
+
     func testTextEditsInvalidateReviewWithoutConfirmingSpeakerAndNotesUseCorrectedSnapshot() async throws {
         let (root, store, original) = try fixture()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -268,10 +395,13 @@ final class MeetingEditorModelTests: XCTestCase {
         XCTAssertNil(model.error)
         XCTAssertNotNil(model.document?.notes?.sourceTranscriptHash)
         XCTAssertFalse(model.document?.notesAreStale ?? true)
+        XCTAssertFalse(model.readingSnapshot.notesAreStale)
+        XCTAssertEqual(model.readingSnapshot.paragraphs.map(\.text), ["Corrected words"])
         model.updateNotes { $0.summary = "My revised notes" }
         XCTAssertFalse(model.document?.notesAreStale ?? true)
         model.updateText(regionID: "one", text: "A later correction")
         XCTAssertTrue(model.document?.notesAreStale ?? false)
+        XCTAssertTrue(model.readingSnapshot.notesAreStale)
         XCTAssertEqual(model.document?.notes?.summary, "My revised notes")
         XCTAssertEqual(model.document?.words, meeting.words)
     }
