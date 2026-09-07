@@ -226,9 +226,12 @@ stays under `.build/meeting-evidence/recordings`; set
 `QUILL_MEETING_TEST_ROOT` to choose another test root. The preview executable
 also accepts `analyze AUDIO_PATH PARTICIPANTS` for local pipeline verification
 without printing the transcript into the terminal. For notes evaluation, use
-`notes TRANSCRIPT_PATH MODEL_ID STRATEGY OUTPUT_JSON`, where `STRATEGY` is
-`evidenceFirst` or `singlePass`. This developer command
-saves raw intermediate model output beside the result; the normal app does
+`notes TRANSCRIPT_PATH MODEL_ID STRATEGY OUTPUT_JSON [OPTIONS_JSON]`, where
+`STRATEGY` is `evidenceFirst`, `singlePass`, or the experimental `verifiedEvidence`.
+The optional JSON file controls stage-specific sampling, bounded thinking, and
+verification ablations; see [the evaluation guide](scripts/notes-eval/README.md).
+This developer command saves intermediate JSON output beside the result in a
+private directory. Thinking continuations are not retained. The normal app does
 not retain intermediate prompts or model output.
 
 `scripts/notes-eval/run.py --help` describes the serial evaluation runner and

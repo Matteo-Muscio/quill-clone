@@ -47,10 +47,10 @@ enum NotesPromptFormat {
     /// Publisher temperature/filter settings with neutral local penalties.
     /// Qwen 2B text recommendations differ from the 4B card's general non-thinking
     /// recommendations; neither is inferred from the other's vision settings.
-    static func samplingArguments(for model: NotesModel) -> [String] {
-        let temperature: String
-        let topP: String
-        let topK: String
+    static func samplingArguments(for model: NotesModel, options: NotesCompletionOptions = .init()) -> [String] {
+        var temperature: String
+        var topP: String
+        var topK: String
         switch model {
         case .qwen35_2B:
             // https://huggingface.co/Qwen/Qwen3.5-2B/blob/15852e8c16360a2fea060d615a32b45270f8a8fc/README.md
@@ -65,6 +65,9 @@ enum NotesPromptFormat {
             // https://github.com/huggingface/transformers/blob/v4.54.0/src/transformers/generation/configuration_utils.py
             temperature = "0.6"; topP = "0.95"; topK = "50"
         }
+        if let value = options.temperature { temperature = String(value) }
+        if let value = options.topP { topP = String(value) }
+        if let value = options.topK { topK = String(value) }
         // Explicit order follows Transformers' temperature -> top_k -> top_p
         // filtering, with penalties first; omit unrelated optional samplers.
         // Qwen recommends presence 2.0 (2B) / 1.5 (4B), but b10837 completion
@@ -82,6 +85,25 @@ enum NotesPromptFormat {
                 "--temp", temperature, "--top-p", topP, "--top-k", topK,
                 "--min-p", "0.0", "--presence-penalty", "0.0",
                 "--repeat-penalty", "1.0", "--frequency-penalty", "0.0", "--repeat-last-n", "64"]
+    }
+
+    /// Only our trusted, already-escaped assistant suffix may open reasoning.
+    /// The raw completion CLI does not wire --reasoning-budget to this prompt.
+    static func thinkingPrompt(from prompt: String, model: NotesModel) throws -> String {
+        let suffix = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        guard model == .qwen35_4B, prompt.hasSuffix(suffix) else {
+            throw MeetingNotesError.invalidGenerationOptions
+        }
+        return String(prompt.dropLast(suffix.count)) + "<|im_start|>assistant\n<think>\n"
+    }
+
+    /// Discard the stop marker and anything after it, then neutralize generated
+    /// control tokens before replay. A capped first pass may end mid-sentence;
+    /// the explicit trusted closing tag still sends pass two into final mode.
+    static func finalPrompt(thinkingPrompt: String, reasoning: Data) -> String {
+        let raw = String(decoding: reasoning, as: UTF8.self)
+        let body = raw.components(separatedBy: "</think>").first ?? ""
+        return thinkingPrompt + escaped(body) + "\n</think>\n\n"
     }
 
     /// Preserve readable source text while preventing literal model-control
