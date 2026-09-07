@@ -110,7 +110,7 @@ alternative. Both run through
 [FluidAudio](https://github.com/FluidInference/FluidAudio)'s Core ML port —
 roughly 20 seconds per hour of audio on Apple Silicon.
 
-Models are about 600 MB and are never downloaded implicitly. Open
+Transcription models are about 600 MB and are never downloaded implicitly. Open
 **Settings… → Transcription**, choose a model, and click **Download & Use**;
 `quill doctor` reports whether the selected model is already cached.
 
@@ -136,6 +136,46 @@ pending jobs, not completed partial transcripts.
 
 Quill also restores a missing `transcript.md` from a valid `transcript.json`
 when scanning pending work, without loading a model or repeating transcription.
+
+## Imported in-person meetings
+
+Record with iPhone Voice Memos, AirDrop the `.m4a` to this Mac, then choose
+**Edit an imported recording…** from Quill's menu. Drop the file into the
+editor or choose **Import recording**. No iPhone companion app is required.
+
+The editor copies the original audio into **Imported Meetings** inside your
+recordings folder. It shows the full waveform and duration, then uses your
+participant count to prepare speaker lanes. Set up a transcription model in
+Settings first. Starting **Transcribe** runs the selected Parakeet model and
+FluidAudio's offline speaker diarizer locally. The separate speaker models
+download on first use; recording audio is never uploaded.
+
+Select a segment to hear it and inspect its words. Move it to another speaker
+lane, assign a speaker with the number keys, split at the playhead, or adjust
+its boundaries. These operations change speaker annotations while preserving
+the original audio and its timing. Overlapping speech can belong to multiple
+speakers; the lanes are not isolated audio stems. Other or ambiguous voices
+remain visible instead of being forced into a participant's identity.
+
+Confirmed corrections are protected. After confirming clear examples of each
+detected participant, **Refine remaining audio** compares session-local voice
+evidence to those examples and revisits unconfirmed segments. Weak matches stay
+uncertain. This is conservative acoustic matching, not model retraining or
+cross-meeting voice recognition. It cannot recover words obscured by noise or
+simultaneous speech. Refinement is undoable.
+
+Sessions save automatically and can be reopened from the editor. `session.json`
+is the editable source of truth; `transcript.json` and `transcript.md` are
+regenerated from the corrected annotations. A failed save stays visible and
+must be retried before closing or quitting. Imports do not enter the normal
+mic/system transcription queue or run its hooks.
+
+For development, `bash scripts/build-meeting-preview.sh` creates an isolated
+native editor using the real views and local inference. Its default test data
+stays under `.build/meeting-evidence/recordings`; set
+`QUILL_MEETING_TEST_ROOT` to choose another test root. The preview executable
+also accepts `analyze AUDIO_PATH PARTICIPANTS` for local pipeline verification
+without printing the transcript into the terminal.
 
 The engine sits behind a small protocol; a Whisper engine (WhisperKit
 large-v3-turbo) is planned as the fallback / re-transcription option.

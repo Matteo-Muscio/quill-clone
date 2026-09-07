@@ -101,6 +101,18 @@ actor ModelStore {
         }
     }
 
+    /// Imported meetings explicitly prepare a separate diarization model.
+    /// Share the same gate as ASR so FluidAudio's global offline flag cannot
+    /// change beneath either loader while it is suspended.
+    func loadMeetingDiarizerModels() async throws -> OfflineDiarizerModels {
+        try await acquire()
+        defer { release() }
+        try Task.checkCancellation()
+        return try await withOfflineMode(false) {
+            try await OfflineDiarizerModels.load()
+        }
+    }
+
     func downloadAndVerify(
         _ model: TranscriptionModel,
         progress: @escaping ProgressHandler,

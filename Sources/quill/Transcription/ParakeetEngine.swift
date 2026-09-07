@@ -79,6 +79,28 @@ actor ParakeetEngine: TranscriptionEngine {
         manager = nil
     }
 
+    /// Word timings for the imported-meeting editor. Existing live-recording
+    /// transcription keeps its sentence grouping and fallback behavior.
+    func transcribeWords(_ audio: URL) async throws -> [WordTiming] {
+        guard let manager else { throw EngineError.notPrepared }
+        try Task.checkCancellation()
+        do {
+            let probe = try AVAudioFile(forReading: audio)
+            guard probe.length > 0 else { throw EngineError.unreadableAudio(audio, nil) }
+        } catch let error as EngineError {
+            throw error
+        } catch {
+            throw EngineError.unreadableAudio(audio, error)
+        }
+        var state = try TdtDecoderState()
+        let result = try await manager.transcribe(audio, decoderState: &state)
+        try Task.checkCancellation()
+        let words = buildWordTimings(from: result.tokenTimings ?? [])
+        if !words.isEmpty { return words }
+        let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? [] : [WordTiming(word: text, startTime: 0, endTime: result.duration)]
+    }
+
     /// Group word timings into readable segments: break on sentence-ending
     /// punctuation (parakeet v2 emits punctuation), a silence gap, or a hard
     /// length cap so a run-on speaker still wraps.
