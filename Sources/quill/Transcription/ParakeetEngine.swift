@@ -26,10 +26,13 @@ actor ParakeetEngine: TranscriptionEngine {
     nonisolated var model: String { selection.provenance }
 
     private nonisolated let selection: TranscriptionModel
+    private let asrConfig: ASRConfig
     private var manager: AsrManager?
 
-    init(model: TranscriptionModel = Config.transcriptionModel()) {
+    /// The override supports developer comparisons while preserving production defaults.
+    init(model: TranscriptionModel = Config.transcriptionModel(), asrConfig: ASRConfig = .default) {
         selection = model
+        self.asrConfig = asrConfig
     }
 
     func prepare() async throws {
@@ -40,7 +43,7 @@ actor ParakeetEngine: TranscriptionEngine {
         } catch ModelStoreError.notInstalled {
             throw EngineError.modelNotInstalled(selection)
         }
-        let manager = AsrManager()
+        let manager = AsrManager(config: asrConfig)
         try await manager.loadModels(models)
         self.manager = manager
     }
