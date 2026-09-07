@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct MeetingSpeaker: Codable, Sendable, Equatable, Identifiable {
     var id: String
@@ -29,6 +30,33 @@ struct MeetingAcousticEvidence: Codable, Sendable, Equatable {
     var windowID: String? = nil
 }
 
+/// An editorial replacement anchored to audio time, independent of speaker labels.
+/// The ASR words remain intact so the recognized text can always be inspected.
+struct MeetingTextCorrection: Codable, Sendable, Equatable, Identifiable {
+    var id: String = UUID().uuidString
+    var start: Double
+    var end: Double
+    var text: String
+}
+
+struct MeetingNotes: Codable, Sendable, Equatable {
+    var title: String
+    var summary: String
+    var keyTakeaways: [String]
+    var actionItems: [String]
+    var modelID: String
+    var generatedAt: Date = Date()
+    var sourceTranscriptHash: String? = nil
+}
+
+struct MeetingTranscriptParagraph: Sendable, Equatable, Identifiable {
+    var id: String
+    var start: Double
+    var end: Double
+    var speakerIDs: [String]
+    var text: String
+}
+
 struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
     var id: String = UUID().uuidString
     var title: String
@@ -42,18 +70,133 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
     var provenance: String = "Imported recording"
+    var textCorrections: [MeetingTextCorrection] = []
+    var reviewedAt: Date? = nil
+    var notes: MeetingNotes? = nil
+    /// nil means automatic speaker discovery. Lane identities are independent.
+    var participantCountHint: Int? = nil
+
+    var hasTextCorrections: Bool { !textCorrections.isEmpty }
+    var transcriptMarkdown: String { transcriptText }
+    var transcriptFingerprint: String {
+        SHA256.hash(data: Data(transcriptMarkdown.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+    var notesAreStale: Bool {
+        guard let source = notes?.sourceTranscriptHash else { return false }
+        return source != transcriptFingerprint
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, audioFilename, duration, speakers, regions, words, waveform, acousticEvidence
+        case createdAt, updatedAt, provenance, textCorrections, reviewedAt, notes, participantCountHint
+    }
 
     /// Midpoint ownership prevents a word crossing a speaker boundary appearing twice.
     func text(for region: MeetingRegion) -> String {
-        words.filter {
-            let midpoint = $0.start + ($0.end - $0.start) / 2
-            return midpoint >= region.start && midpoint < region.end
-        }.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        text(in: region, from: effectiveWords)
+    }
+
+    func originalText(for region: MeetingRegion) -> String {
+        text(in: region, from: words)
+    }
+
+    var transcriptText: String {
+        var lines = ["# \(title.replacingOccurrences(of: "\n", with: " "))", ""]
+        for paragraph in transcriptParagraphs {
+            let seconds = Int(paragraph.start)
+            let stamp = String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+            lines.append("[\(stamp)] \(speakerName(for: paragraph.speakerIDs)): \(paragraph.text)")
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// Reading/export shares paragraphs while the editing timeline retains every
+    /// original diarization boundary, including segments with no recognized words.
+    var transcriptParagraphs: [MeetingTranscriptParagraph] {
+        let displayWords = effectiveWords
+        var result: [MeetingTranscriptParagraph] = []
+        for region in regions.sorted(by: { $0.start < $1.start }) {
+            let content = text(in: region, from: displayWords)
+            guard !content.isEmpty else { continue }
+            if let previous = result.last, previous.speakerIDs == region.speakerIDs,
+               region.start - previous.end <= 1.5, previous.text.count + content.count + 1 <= 600 {
+                result[result.count - 1].text += " " + content
+                result[result.count - 1].end = region.end
+            } else {
+                result.append(.init(id: region.id, start: region.start, end: region.end,
+                                    speakerIDs: region.speakerIDs, text: content))
+            }
+        }
+        return result
+    }
+
+    private var effectiveWords: [MeetingWord] {
+        guard !textCorrections.isEmpty else { return words }
+        let recognized = words.filter { word in
+            let midpoint = word.start + (word.end - word.start) / 2
+            return !textCorrections.contains { midpoint >= $0.start && midpoint < $0.end }
+        }
+        return (recognized + textCorrections.flatMap(correctionWords)).sorted { $0.start < $1.start }
+    }
+
+    private func text(in region: MeetingRegion, from words: [MeetingWord]) -> String {
+        words.filter { owns($0, start: region.start, end: region.end) }.map(\.text)
+            .joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func owns(_ word: MeetingWord, start: Double, end: Double) -> Bool {
+        let midpoint = word.start + (word.end - word.start) / 2
+        return midpoint >= start && midpoint < end
+    }
+
+    /// Edited text has approximate timing within its selected interval, rather
+    /// than fabricated word alignment. Midpoint ownership preserves it on splits.
+    private func correctionWords(_ correction: MeetingTextCorrection) -> [MeetingWord] {
+        let tokens = correction.text.split(whereSeparator: \.isWhitespace).map(String.init)
+        let step = (correction.end - correction.start) / Double(max(1, tokens.count))
+        return tokens.enumerated().map { index, text in
+            MeetingWord(start: correction.start + Double(index) * step,
+                        end: correction.start + Double(index + 1) * step, text: text)
+        }
+    }
+
+    @discardableResult
+    mutating func replaceText(regionID: String, text: String) -> Bool {
+        guard let region = regions.first(where: { $0.id == regionID }) else { return false }
+        let normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        let current = self.text(for: region).split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard normalized != current else { return false }
+        var retained: [MeetingTextCorrection] = []
+        for correction in textCorrections {
+            guard correction.start < region.end && correction.end > region.start else {
+                retained.append(correction)
+                continue
+            }
+            let tokens = correctionWords(correction)
+            if correction.start < region.start {
+                let text = tokens.filter { owns($0, start: correction.start, end: region.start) }.map(\.text).joined(separator: " ")
+                retained.append(.init(start: correction.start, end: region.start, text: text))
+            }
+            if correction.end > region.end {
+                let text = tokens.filter { owns($0, start: region.end, end: correction.end) }.map(\.text).joined(separator: " ")
+                retained.append(.init(start: region.end, end: correction.end, text: text))
+            }
+        }
+        retained.append(.init(start: region.start, end: region.end, text: text))
+        textCorrections = retained.sorted { $0.start < $1.start }
+        reviewedAt = nil
+        updatedAt = Date()
+        return true
     }
 
     func speakerName(for region: MeetingRegion) -> String {
-        if region.speakerIDs.isEmpty { return region.isUncertain ? "Uncertain" : "Other" }
-        return region.speakerIDs.map { id in speakers.first { $0.id == id }?.name ?? "Unknown" }
+        speakerName(for: region.speakerIDs)
+    }
+
+    func speakerName(for speakerIDs: [String]) -> String {
+        if speakerIDs.isEmpty { return "Unassigned" }
+        return speakerIDs.map { id in speakers.first { $0.id == id }?.name ?? "Unknown" }
             .joined(separator: " + ")
     }
 
@@ -153,7 +296,8 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
     @discardableResult
     mutating func renameSpeaker(id: String, name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let index = speakers.firstIndex(where: { $0.id == id }) else { return false }
+        guard !trimmed.isEmpty, let index = speakers.firstIndex(where: { $0.id == id }),
+              speakers[index].name != trimmed else { return false }
         speakers[index].name = trimmed
         updatedAt = Date()
         return true
@@ -161,7 +305,11 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
 
     /// Confirmed intervals have absolute priority, including Other and overlap labels.
     /// New analysis may only fill the unconfirmed complement of those intervals.
-    mutating func applyAnalysis(regions proposals: [MeetingRegion], words newWords: [MeetingWord]? = nil) {
+    @discardableResult
+    mutating func applyAnalysis(regions proposals: [MeetingRegion], words newWords: [MeetingWord]? = nil) -> Bool {
+        // Re-running recognition requires explicit removal of editorial overlays.
+        // Refinement supplies no new words and can safely preserve them.
+        guard newWords == nil || !hasTextCorrections else { return false }
         let confirmed = regions.filter(\.isConfirmed).sorted { $0.start < $1.start }
         var result = confirmed
         for proposal in proposals {
@@ -188,7 +336,39 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
         regions = result
         if let newWords { words = newWords }
         sortRegions()
+        reviewedAt = nil
         updatedAt = Date()
+        return true
+    }
+
+    @discardableResult
+    mutating func renameTitle(_ name: String) -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != title else { return false }
+        title = trimmed
+        updatedAt = Date()
+        return true
+    }
+
+    @discardableResult
+    mutating func addSpeaker(name: String = "") -> String {
+        var number = speakers.count + 1
+        while speakers.contains(where: { $0.id == "speaker-\(number)" }) { number += 1 }
+        let id = "speaker-\(number)"
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        speakers.append(.init(id: id, name: trimmed.isEmpty ? "Speaker \(number)" : trimmed))
+        reviewedAt = nil
+        updatedAt = Date()
+        return id
+    }
+
+    @discardableResult
+    mutating func removeSpeaker(_ id: String) -> Bool {
+        guard !regions.contains(where: { $0.speakerIDs.contains(id) }), speakers.contains(where: { $0.id == id }) else { return false }
+        speakers.removeAll { $0.id == id }
+        reviewedAt = nil
+        updatedAt = Date()
+        return true
     }
 
     func validate() throws {
@@ -200,6 +380,7 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
         }
         let speakerIDs = Set(speakers.map(\.id))
         let orderedRegions = regions.sorted { $0.start < $1.start }
+        let orderedCorrections = textCorrections.sorted { $0.start < $1.start }
         guard speakerIDs.count == speakers.count,
               speakers.allSatisfy({ !$0.id.isEmpty && !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }),
               Set(regions.map(\.id)).count == regions.count,
@@ -211,7 +392,13 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
               }), words.allSatisfy({ validInterval($0.start, $0.end, allowEmpty: true) }),
               waveform.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1 }),
               acousticEvidence.allSatisfy({ validInterval($0.start, $0.end) && $0.embedding.allSatisfy(\.isFinite) }),
-              zip(orderedRegions, orderedRegions.dropFirst()).allSatisfy({ $0.end <= $1.start })
+              zip(orderedRegions, orderedRegions.dropFirst()).allSatisfy({ $0.end <= $1.start }),
+              textCorrections.allSatisfy({ validInterval($0.start, $0.end) }),
+              Set(textCorrections.map(\.id)).count == textCorrections.count,
+              zip(orderedCorrections, orderedCorrections.dropFirst()).allSatisfy({ $0.end <= $1.start }),
+              participantCountHint.map({ (1...12).contains($0) }) ?? true,
+              reviewedAt.map({ $0.timeIntervalSince1970.isFinite }) ?? true,
+              notes.map({ $0.generatedAt.timeIntervalSince1970.isFinite }) ?? true
         else { throw MeetingStoreError.invalidDocument("Invalid speakers, annotation times, or audio evidence.") }
     }
 
@@ -227,5 +414,27 @@ struct MeetingDocument: Codable, Sendable, Equatable, Identifiable {
 
     private mutating func sortRegions() {
         regions.sort { $0.start == $1.start ? $0.end < $1.end : $0.start < $1.start }
+    }
+}
+
+extension MeetingDocument {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        title = try values.decode(String.self, forKey: .title)
+        audioFilename = try values.decode(String.self, forKey: .audioFilename)
+        duration = try values.decode(Double.self, forKey: .duration)
+        speakers = try values.decode([MeetingSpeaker].self, forKey: .speakers)
+        regions = try values.decode([MeetingRegion].self, forKey: .regions)
+        words = try values.decode([MeetingWord].self, forKey: .words)
+        waveform = try values.decode([Float].self, forKey: .waveform)
+        acousticEvidence = try values.decode([MeetingAcousticEvidence].self, forKey: .acousticEvidence)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        updatedAt = try values.decode(Date.self, forKey: .updatedAt)
+        provenance = try values.decode(String.self, forKey: .provenance)
+        textCorrections = try values.decodeIfPresent([MeetingTextCorrection].self, forKey: .textCorrections) ?? []
+        reviewedAt = try values.decodeIfPresent(Date.self, forKey: .reviewedAt)
+        notes = try values.decodeIfPresent(MeetingNotes.self, forKey: .notes)
+        participantCountHint = try values.decodeIfPresent(Int.self, forKey: .participantCountHint)
     }
 }

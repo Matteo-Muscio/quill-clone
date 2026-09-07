@@ -23,6 +23,7 @@ final class MeetingEditorModelTests: XCTestCase {
         document.duration = 0.5
         document.waveform = [0]
         document.speakers = [.init(id: "speaker-1", name: "Speaker 1"), .init(id: "speaker-2", name: "Speaker 2")]
+        document.participantCountHint = 2
         try store.save(document)
         return (root, store, document)
     }
@@ -47,6 +48,44 @@ final class MeetingEditorModelTests: XCTestCase {
         model.undo()
         XCTAssertEqual(model.document?.speakers.first?.name, "Speaker 1")
         XCTAssertEqual(model.participantCount, model.document?.speakers.count)
+    }
+
+    func testRepeatedNameCommitCreatesOnlyOneUndoEntry() throws {
+        let (root, _, document) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = MeetingEditorModel(root: root, modelProvider: { .default })
+        model.open(document.id)
+        model.rename("speaker-1", "Matteo")
+        let renamed = model.document
+        model.rename("speaker-1", "  Matteo  ")
+        XCTAssertEqual(model.document, renamed)
+        XCTAssertEqual(model.undoCount, 1)
+        model.undo()
+        XCTAssertEqual(model.document?.speakers.first?.name, "Speaker 1")
+    }
+
+    func testUnchangedTitleTranscriptAndNotesCommitsDoNotAddUndoEntries() throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var meeting = original
+        meeting.regions = [.init(id: "one", start: 0, end: 0.5, speakerIDs: ["speaker-1"])]
+        meeting.words = [.init(start: 0, end: 0.5, text: "Original words")]
+        meeting.notes = .init(title: "Notes", summary: "Summary", keyTakeaways: [], actionItems: [], modelID: "test-local")
+        try store.save(meeting)
+        let model = MeetingEditorModel(root: root, modelProvider: { .default })
+        model.open(meeting.id)
+        model.renameTitle("  \(meeting.title)  ")
+        model.updateText(regionID: "one", text: " Original   words \n")
+        model.updateNotes { $0.summary = "Summary" }
+        model.setNotes(try XCTUnwrap(meeting.notes))
+        XCTAssertEqual(model.document, meeting)
+        XCTAssertEqual(model.undoCount, 0)
+        XCTAssertFalse(model.document?.hasTextCorrections ?? true)
+        model.updateNotes { $0.summary = "Changed summary" }
+        model.updateNotes { $0.summary = "Changed summary" }
+        XCTAssertEqual(model.undoCount, 1)
+        model.undo()
+        XCTAssertEqual(model.document?.notes?.summary, "Summary")
     }
 
     func testUnreadableNextRecordingDoesNotKeepPreviousPlayer() throws {
@@ -139,4 +178,106 @@ final class MeetingEditorModelTests: XCTestCase {
         XCTAssertFalse(reportedBusy)
         XCTAssertNil(model.error)
     }
+
+    func testImportAutomaticallyTranscribesAndAddsDiscoveredSpeakers() async throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = MeetingTranscriptionProbe()
+        let model = MeetingEditorModel(root: root, modelProvider: { .default }, transcriber: { _, count, _, _ in
+            await probe.begin(count: count)
+            return .init(words: [.init(start: 0, end: 0.2, text: "Hello")],
+                         regions: [.init(start: 0, end: 0.5, speakerIDs: ["speaker-3"])], acousticEvidence: [])
+        })
+        model.importRecording(try store.audioURL(for: original))
+        for _ in 0..<300 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertNil(model.error)
+        let counts = await probe.counts
+        XCTAssertEqual(counts, [0], "A new import must use automatic speaker discovery")
+        XCTAssertEqual(model.document?.speakers.map(\.id), ["speaker-3"])
+        XCTAssertTrue(model.hasAnalysis)
+        let saved = try store.load(id: XCTUnwrap(model.document?.id))
+        XCTAssertEqual(saved.words.first?.text, "Hello")
+    }
+
+    func testWaveformHandoffKeepsNextOperationBusyAndCancellable() async throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let probe = MeetingTranscriptionProbe()
+        let model = MeetingEditorModel(root: root, modelProvider: { .default }, transcriber: { _, count, _, _ in
+            await probe.begin(count: count)
+            try await Task.sleep(for: .seconds(30))
+            return .init(words: [], regions: [], acousticEvidence: [])
+        })
+        model.importRecording(try store.audioURL(for: original))
+        for _ in 0..<300 {
+            if !(await probe.counts).isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let counts = await probe.counts
+        XCTAssertEqual(counts, [0])
+        XCTAssertTrue(model.isBusy, "Waveform completion must not clear the transcription task's busy state")
+        model.cancel()
+        for _ in 0..<300 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(model.isBusy)
+        XCTAssertFalse(model.hasAnalysis)
+        XCTAssertTrue(model.status.contains("cancelled"))
+    }
+
+    func testAddingSpeakerAssignsOnlySelectedUnassignedRegionUnlessAllRequested() throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var meeting = original
+        meeting.regions = [.init(id: "one", start: 0, end: 0.25, speakerIDs: [], isUncertain: true),
+                           .init(id: "two", start: 0.25, end: 0.5, speakerIDs: [], isUncertain: true)]
+        try store.save(meeting)
+        let model = MeetingEditorModel(root: root, modelProvider: { .default })
+        model.open(meeting.id)
+        model.select("one")
+        model.addSpeaker(name: "Guest")
+        let assigned = try XCTUnwrap(model.document?.regions[0].speakerIDs.first)
+        XCTAssertEqual(model.document?.regions[1].speakerIDs, [])
+        XCTAssertFalse(model.removeSpeaker(assigned))
+        model.participantCount = 1
+        model.configureSpeakers()
+        XCTAssertTrue(model.document?.speakers.contains(where: { $0.id == assigned }) == true)
+        model.addSpeaker(name: "Another guest", assignAllUnknown: true)
+        XCTAssertFalse(model.document?.regions[1].speakerIDs.isEmpty ?? true)
+    }
+
+    func testTextEditsInvalidateReviewWithoutConfirmingSpeakerAndNotesUseCorrectedSnapshot() async throws {
+        let (root, store, original) = try fixture()
+        defer { try? FileManager.default.removeItem(at: root) }
+        var meeting = original
+        meeting.words = [.init(start: 0, end: 0.5, text: "Incorrect")]
+        meeting.regions = [.init(id: "one", start: 0, end: 0.5, speakerIDs: ["speaker-1"])]
+        try store.save(meeting)
+        let model = MeetingEditorModel(root: root, modelProvider: { .default }, noteGenerator: { snapshot, _ in
+            XCTAssertTrue(snapshot.transcriptMarkdown.contains("Corrected words"))
+            return .init(title: "Meeting notes", summary: "Summary [00:00:00]", keyTakeaways: [], actionItems: [], modelID: "test-local")
+        })
+        model.open(meeting.id)
+        model.markReviewed()
+        XCTAssertNotNil(model.document?.reviewedAt)
+        model.updateText(regionID: "one", text: "Corrected words")
+        XCTAssertNil(model.document?.reviewedAt)
+        XCTAssertFalse(model.document?.regions[0].isConfirmed ?? true)
+        XCTAssertTrue(model.canGenerateNotes)
+        model.generateNotes()
+        for _ in 0..<300 where model.isBusy { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertNil(model.error)
+        XCTAssertNotNil(model.document?.notes?.sourceTranscriptHash)
+        XCTAssertFalse(model.document?.notesAreStale ?? true)
+        model.updateNotes { $0.summary = "My revised notes" }
+        XCTAssertFalse(model.document?.notesAreStale ?? true)
+        model.updateText(regionID: "one", text: "A later correction")
+        XCTAssertTrue(model.document?.notesAreStale ?? false)
+        XCTAssertEqual(model.document?.notes?.summary, "My revised notes")
+        XCTAssertEqual(model.document?.words, meeting.words)
+    }
+}
+
+private actor MeetingTranscriptionProbe {
+    private(set) var counts: [Int] = []
+    func begin(count: Int) { counts.append(count) }
 }

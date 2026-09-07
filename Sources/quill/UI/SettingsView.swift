@@ -45,6 +45,7 @@ struct ModelSettingsSummary: Equatable {
 
 struct SettingsView: View {
     @ObservedObject var modelManager: ModelManager
+    @ObservedObject var notesManager: NotesModelManager = .shared
     var transcriptionEnabled: Bool
 
     private var summary: ModelSettingsSummary {
@@ -61,9 +62,15 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                Text("Transcription")
+                Text("Models")
                     .font(.title.weight(.semibold))
                     .accessibilityAddTraits(.isHeader)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Speech to text").font(.title2.weight(.semibold))
+                    Text("Turn recordings into a transcript.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
 
                 HStack(alignment: .top, spacing: 10) {
                     Image(systemName: summary.symbol)
@@ -89,6 +96,23 @@ struct SettingsView: View {
                     Divider()
                 }
 
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Meeting notes").font(.title2.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Text("Experimental. Generate a title, summary, key takeaways and action items from your corrected transcript. Review generated details against the recording.")
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("Models load only when you generate notes and unload when the job finishes. Download once; generation works offline.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+
+                VStack(spacing: 0) {
+                    ForEach(NotesModel.allCases) { model in
+                        Divider()
+                        NotesModelRow(model: model, manager: notesManager)
+                    }
+                    Divider()
+                }
+
                 Label("Models run locally. Audio and transcripts stay on this Mac.", systemImage: "lock.shield")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -99,6 +123,52 @@ struct SettingsView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minWidth: 520, minHeight: 430)
+    }
+}
+
+private struct NotesModelRow: View {
+    let model: NotesModel
+    @ObservedObject var manager: NotesModelManager
+    private var state: ModelState { manager.state(for: model) }
+    private var locked: Bool { manager.actionsLocked || manager.isPreparingModel }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(model.displayName).font(.headline)
+                Spacer()
+                if state == .active {
+                    Label("Selected", systemImage: "checkmark.circle.fill")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            Text("\(ByteCountFormatter.string(fromByteCount: Int64(model.downloadBytes), countStyle: .file)) download · 4-bit")
+                .font(.callout).foregroundStyle(.secondary)
+            switch state {
+            case .downloading(let fraction):
+                ProgressView(value: fraction).accessibilityLabel("Downloading \(model.displayName)")
+                Text("Downloading · \(Int(fraction * 100))%")
+                    .font(.callout).foregroundStyle(.secondary)
+                Button("Cancel", action: manager.cancel)
+            case .verifying:
+                ProgressView().controlSize(.small)
+                Text("Verifying the download…").font(.callout).foregroundStyle(.secondary)
+                Button("Cancel", action: manager.cancel)
+            case .active:
+                Text("Used when you choose Generate notes in a meeting.")
+                    .font(.callout).foregroundStyle(.secondary)
+            case .installed:
+                Button("Use for notes") { manager.activate(model) }.disabled(locked)
+            case .notInstalled:
+                Button("Download and use") { Task { await manager.downloadAndUse(model) } }.disabled(locked)
+            case .failed(let message), .activationFailed(let message):
+                Text(message).font(.callout).foregroundStyle(.red).textSelection(.enabled)
+                Button("Retry") { Task { await manager.downloadAndUse(model) } }.disabled(locked)
+            }
+        }
+        .buttonStyle(.bordered)
+        .padding(.vertical, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

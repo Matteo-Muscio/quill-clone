@@ -144,11 +144,20 @@ Record with iPhone Voice Memos, AirDrop the `.m4a` to this Mac, then choose
 editor or choose **Import recording**. No iPhone companion app is required.
 
 The editor copies the original audio into **Imported Meetings** inside your
-recordings folder. It shows the full waveform and duration, then uses your
-participant count to prepare speaker lanes. Set up a transcription model in
-Settings first. Starting **Transcribe** runs the selected Parakeet model and
-FluidAudio's offline speaker diarizer locally. The separate speaker models
+recordings folder. It shows the full waveform and duration, then automatically
+runs the selected Parakeet model and FluidAudio's offline speaker diarizer.
+Speaker count defaults to **Automatic**; an optional participant count guides
+the next analysis. Automatic detection can merge distinct voices, especially
+in noisy or overlapping recordings. If the count is wrong, set the known
+participant count and run transcription again. The separate speaker models
 download on first use; recording audio is never uploaded.
+
+Double-click a timeline lane name to rename a speaker. **+ Speaker** adds a
+participant after analysis. Unassigned audio can contain several people: adding
+a speaker assigns only the selected unassigned segment unless you explicitly
+choose all unassigned segments. Pinch or hold Option while scrolling to zoom
+around the pointer; ordinary scrolling pans the timeline. Fit and zoom buttons
+remain available.
 
 Select a segment to hear it and inspect its words. Move it to another speaker
 lane, assign a speaker with the number keys, split at the playhead, or adjust
@@ -164,11 +173,39 @@ uncertain. This is conservative acoustic matching, not model retraining or
 cross-meeting voice recognition. It cannot recover words obscured by noise or
 simultaneous speech. Refinement is undoable.
 
+Double-click transcript wording to edit it. Wording corrections save separately
+from speaker confirmations, preserve the original recognition, and survive
+speaker refinement and timeline splits. Running transcription again requires
+explicitly resetting wording corrections first. Double-click the heading to
+rename a meeting. **View transcript** opens a reading view with Copy, Export,
+and a nonlocking **Mark reviewed** state; further transcript edits return it to
+draft.
+
 Sessions save automatically and can be reopened from the editor. `session.json`
 is the editable source of truth; `transcript.json` and `transcript.md` are
 regenerated from the corrected annotations. A failed save stays visible and
 must be retried before closing or quitting. Imports do not enter the normal
 mic/system transcription queue or run its hooks.
+
+### Optional local meeting notes (experimental)
+
+Settings separates **Speech to text** from **Meeting notes**. Download and select
+Qwen3.5 2B Q4_K_M (1.27 GB) or SmolLM3 3B Q4_K_M (1.92 GB), then choose
+**Generate notes** in the transcript reading view. Notes include an editable
+suggested title, summary, key takeaways, and action items based on the corrected
+transcript. **Use as meeting title** applies the suggestion explicitly. Check
+generated claims and timestamp references against the recording. These small
+models can invent details, repeat points, confuse dates, or respond in the
+wrong language, particularly with noisy transcripts. Neither model is a
+verified substitute for reviewing the recording.
+
+Notes run on Apple silicon using a pinned llama.cpp worker downloaded from its
+official release alongside the model. Model and runtime downloads are checked
+against pinned SHA-256 digests. Generation uses bounded context, divides long
+transcripts into sections, and runs one job at a time. The worker exits after
+completion, cancellation, or failure; there is no resident notes server. Once
+downloaded, generation works offline. Models and their selection are stored
+under `~/Library/Application Support/quill/notes/`.
 
 For development, `bash scripts/build-meeting-preview.sh` creates an isolated
 native editor using the real views and local inference. Its default test data

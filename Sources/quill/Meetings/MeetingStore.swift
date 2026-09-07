@@ -143,13 +143,22 @@ struct MeetingStore: Sendable {
         try ensureContained(markdownURL, in: directory)
         try encoder.encode(TranscriptExport(title: document.title, duration: document.duration, segments: segments))
             .write(to: jsonURL, options: .atomic)
-        var lines = ["# \(document.title.replacingOccurrences(of: "\n", with: " "))", ""]
-        for segment in segments {
-            let start = Int(segment.start)
-            let timestamp = String(format: "%02d:%02d:%02d", start / 3600, start / 60 % 60, start % 60)
-            lines.append("[\(timestamp)] \(segment.speaker): \(segment.text)")
-            lines.append("")
+        try Data(document.transcriptMarkdown.utf8).write(to: markdownURL, options: .atomic)
+        let notesJSON = directory.appendingPathComponent("notes.json")
+        let notesMarkdown = directory.appendingPathComponent("notes.md")
+        try ensureContained(notesJSON, in: directory)
+        try ensureContained(notesMarkdown, in: directory)
+        if let notes = document.notes {
+            try encoder.encode(notes).write(to: notesJSON, options: .atomic)
+            let sections = ["# \(notes.title)", notes.summary,
+                            "## Key takeaways\n\n" + notes.keyTakeaways.map { "- \($0)" }.joined(separator: "\n"),
+                            "## Action items\n\n" + notes.actionItems.map { "- \($0)" }.joined(separator: "\n")]
+            try Data(sections.joined(separator: "\n\n").utf8).write(to: notesMarkdown, options: .atomic)
+        } else {
+            // Undoing note generation must not leave a stale export looking current.
+            for url in [notesJSON, notesMarkdown] where FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
         }
-        try Data(lines.joined(separator: "\n").utf8).write(to: markdownURL, options: .atomic)
     }
 }

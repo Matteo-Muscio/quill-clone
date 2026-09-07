@@ -94,10 +94,10 @@ final class MeetingDocumentTests: XCTestCase {
         let fixed = meeting.regions[0]
         meeting.applyAnalysis(regions: [.init(start: 0, end: 20, speakerIDs: ["b"])])
         XCTAssertEqual(meeting.regions[0], fixed)
-        XCTAssertEqual(meeting.speakerName(for: fixed), "Other")
+        XCTAssertEqual(meeting.speakerName(for: fixed), "Unassigned")
         XCTAssertTrue(meeting.setUncertain(regionID: fixed.id))
         XCTAssertFalse(meeting.regions[0].isConfirmed)
-        XCTAssertEqual(meeting.speakerName(for: meeting.regions[0]), "Uncertain")
+        XCTAssertEqual(meeting.speakerName(for: meeting.regions[0]), "Unassigned")
     }
 
     func testRenameAndOverlapReflectInTranscriptLabels() {
@@ -125,5 +125,78 @@ final class MeetingDocumentTests: XCTestCase {
         meeting = document()
         meeting.regions[1].start = 9
         XCTAssertThrowsError(try meeting.validate())
+    }
+
+    func testTextCorrectionsPreserveOriginalWordsAcrossSplitAndSpeakerRefinement() throws {
+        var meeting = document()
+        let originalWords = meeting.words
+        XCTAssertTrue(meeting.replaceText(regionID: "first", text: "Corrected opening words here"))
+        XCTAssertFalse(meeting.regions[0].isConfirmed, "Text editing must not confirm a speaker")
+        XCTAssertEqual(meeting.originalText(for: meeting.regions[0]), "crossing later")
+        let right = try XCTUnwrap(meeting.split(regionID: "first", at: 5))
+        XCTAssertEqual(meeting.text(for: meeting.regions[0]), "Corrected opening")
+        XCTAssertEqual(meeting.text(for: meeting.regions[1]), "words here")
+        meeting.setUncertain(regionID: "first")
+        meeting.setUncertain(regionID: right)
+        XCTAssertTrue(meeting.applyAnalysis(regions: [.init(start: 0, end: 20, speakerIDs: ["b"])]))
+        XCTAssertEqual(meeting.text(for: meeting.regions[0]), "Corrected opening words here")
+        XCTAssertEqual(meeting.words, originalWords)
+        XCTAssertFalse(meeting.applyAnalysis(regions: [], words: []), "Re-recognition must not silently replace edited text")
+        XCTAssertEqual(meeting.words, originalWords)
+        try meeting.validate()
+    }
+
+    func testEditingSplitCorrectionPreservesTextOutsideEditedHalfAndSupportsDeletion() throws {
+        var meeting = document()
+        meeting.replaceText(regionID: "first", text: "One two three four")
+        let right = try XCTUnwrap(meeting.split(regionID: "first", at: 5))
+        meeting.replaceText(regionID: right, text: "Better ending")
+        XCTAssertEqual(meeting.text(for: meeting.regions[0]), "One two")
+        XCTAssertEqual(meeting.text(for: meeting.regions[1]), "Better ending")
+        meeting.replaceText(regionID: right, text: "")
+        XCTAssertEqual(meeting.text(for: meeting.regions[1]), "")
+        XCTAssertEqual(meeting.originalText(for: meeting.regions[1]), "crossing later")
+        try meeting.validate()
+    }
+
+    func testLegacyDocumentDecodesWithoutEditorialFields() throws {
+        let meeting = document()
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(meeting)) as? [String: Any])
+        for key in ["textCorrections", "reviewedAt", "notes", "participantCountHint"] { object.removeValue(forKey: key) }
+        let decoded = try JSONDecoder().decode(MeetingDocument.self, from: JSONSerialization.data(withJSONObject: object))
+        XCTAssertEqual(decoded.words, meeting.words)
+        XCTAssertTrue(decoded.textCorrections.isEmpty)
+        XCTAssertNil(decoded.notes)
+        XCTAssertNil(decoded.reviewedAt)
+        XCTAssertNil(decoded.participantCountHint)
+    }
+
+    func testReadableParagraphsGroupSameSpeakerSkipEmptySegmentsAndUseCorrections() {
+        var meeting = document()
+        meeting.regions = [.init(id: "a", start: 0, end: 3, speakerIDs: ["a"]),
+                           .init(id: "empty", start: 3, end: 4, speakerIDs: ["a"]),
+                           .init(id: "b", start: 4, end: 6, speakerIDs: ["a"]),
+                           .init(id: "c", start: 6, end: 10, speakerIDs: ["b"])]
+        meeting.words = [.init(start: 1, end: 2, text: "First"), .init(start: 4, end: 5, text: "second"),
+                         .init(start: 7, end: 8, text: "Third")]
+        meeting.replaceText(regionID: "b", text: "corrected second")
+        XCTAssertEqual(meeting.transcriptParagraphs.count, 2)
+        XCTAssertEqual(meeting.transcriptParagraphs[0].id, "a")
+        XCTAssertEqual(meeting.transcriptParagraphs[0].text, "First corrected second")
+        XCTAssertTrue(meeting.transcriptMarkdown.contains("Matteo: First corrected second"))
+        XCTAssertFalse(meeting.transcriptMarkdown.contains("No recognized words"))
+        XCTAssertEqual(meeting.regions.count, 4)
+    }
+
+    func testNotesBecomeStaleWithoutBeingDiscardedWhenTranscriptChanges() {
+        var meeting = document()
+        meeting.notes = MeetingNotes(title: "Lunch", summary: "Summary", keyTakeaways: [], actionItems: [],
+                                     modelID: "local", sourceTranscriptHash: meeting.transcriptFingerprint)
+        XCTAssertFalse(meeting.notesAreStale)
+        meeting.notes?.summary = "Edited summary"
+        XCTAssertFalse(meeting.notesAreStale)
+        meeting.replaceText(regionID: "first", text: "A corrected fact")
+        XCTAssertTrue(meeting.notesAreStale)
+        XCTAssertEqual(meeting.notes?.summary, "Edited summary")
     }
 }
